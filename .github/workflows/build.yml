@@ -1,0 +1,44 @@
+name: Build PakkaBaat APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}   # lets you click "Run workflow" manually on GitHub too
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Inject API keys (if configured)
+        run: |
+          {
+            echo "PAKKABAAT_BHASHINI_USER_ID=${{ secrets.BHASHINI_USER_ID }}"
+            echo "PAKKABAAT_BHASHINI_API_KEY=${{ secrets.BHASHINI_API_KEY }}"
+            echo "PAKKABAAT_GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}"
+          } >> gradle.properties
+
+      - name: Build debug APK
+        run: gradle assembleDebug --stacktrace
+
+      - name: Upload APK as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PakkaBaat-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
