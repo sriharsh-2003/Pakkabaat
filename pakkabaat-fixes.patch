@@ -1,0 +1,516 @@
+diff --git a/app/src/main/java/com/pakkabaat/app/MainActivity.kt b/app/src/main/java/com/pakkabaat/app/MainActivity.kt
+index 9ffd109..fcd29ad 100644
+--- a/app/src/main/java/com/pakkabaat/app/MainActivity.kt
++++ b/app/src/main/java/com/pakkabaat/app/MainActivity.kt
+@@ -4,6 +4,8 @@ import android.os.Bundle
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.setContent
+ import androidx.activity.enableEdgeToEdge
++import androidx.compose.foundation.background
++import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.safeDrawingPadding
+ import androidx.compose.material3.MaterialTheme
+@@ -18,15 +20,31 @@ class MainActivity : ComponentActivity() {
+         enableEdgeToEdge()
+         setContent {
+             PakkaBaatTheme {
+-                // enableEdgeToEdge() draws behind the status bar/notch by design, but that
+-                // means something has to consume those insets or content gets clipped under
+-                // them (the bug reported). safeDrawingPadding() pushes content below the
+-                // notch/status bar and above the nav bar, on every screen, in one place.
+-                Surface(
+-                    modifier = Modifier.fillMaxSize().safeDrawingPadding(),
+-                    color = MaterialTheme.colorScheme.background
++                // enableEdgeToEdge() makes the status bar / notch / nav bar fully
++                // transparent so the app can draw behind them. The previous code only
++                // applied safeDrawingPadding() to the *content* Surface, which correctly
++                // keeps content from being clipped — but it also means the content's
++                // background colour stops exactly at the edge of the notch/status/nav
++                // bar. Nothing else was painting that region, so it fell through to the
++                // plain window background (from themes.xml, which has no background/
++                // dark-mode override), showing up as a colour that doesn't match the
++                // app (the bug reported).
++                //
++                // Fix: an outer Box with no inset padding paints the *entire* window,
++                // edge-to-edge, in the theme's background colour (so it's correct in
++                // both light and dark mode). safeDrawingPadding() then only applies to
++                // the inner content, which is inset away from the system bars as before.
++                Box(
++                    modifier = Modifier
++                        .fillMaxSize()
++                        .background(MaterialTheme.colorScheme.background)
+                 ) {
+-                    PakkaBaatNavGraph()
++                    Surface(
++                        modifier = Modifier.fillMaxSize().safeDrawingPadding(),
++                        color = MaterialTheme.colorScheme.background
++                    ) {
++                        PakkaBaatNavGraph()
++                    }
+                 }
+             }
+         }
+diff --git a/app/src/main/java/com/pakkabaat/app/data/repository/IdentityStore.kt b/app/src/main/java/com/pakkabaat/app/data/repository/IdentityStore.kt
+new file mode 100644
+index 0000000..9b8fd0c
+--- /dev/null
++++ b/app/src/main/java/com/pakkabaat/app/data/repository/IdentityStore.kt
+@@ -0,0 +1,52 @@
++package com.pakkabaat.app.data.repository
++
++import android.content.Context
++import java.util.UUID
++
++/**
++ * Persists the user's own identity (userId, display name, preferred language) across app
++ * restarts. Before this existed, SessionViewModel only ever held this in in-memory
++ * StateFlow state set from OnboardingScreen/SplashLanguageScreen — so every process
++ * restart lost it and sent the user back through the splash + onboarding flow, and
++ * there was no way to edit the name/language afterwards (SettingsScreen only ever
++ * touched the Gemini API key).
++ *
++ * Not sensitive data, so plain SharedPreferences is enough here (no need for the
++ * EncryptedSharedPreferences overhead used for the Gemini key in ApiKeyStore).
++ */
++class IdentityStore(context: Context) {
++
++    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
++
++    fun hasIdentity(): Boolean = prefs.contains(KEY_NAME)
++
++    fun getUserId(): String {
++        val existing = prefs.getString(KEY_USER_ID, null)
++        if (existing != null) return existing
++        val generated = UUID.randomUUID().toString()
++        prefs.edit().putString(KEY_USER_ID, generated).apply()
++        return generated
++    }
++
++    fun getName(): String? = prefs.getString(KEY_NAME, null)
++
++    fun getLanguage(): String = prefs.getString(KEY_LANGUAGE, null) ?: "hi"
++
++    /** Called once, from onboarding, the first time the user sets up the app. */
++    fun saveIdentity(name: String, language: String) {
++        prefs.edit()
++            .putString(KEY_NAME, name.trim())
++            .putString(KEY_LANGUAGE, language)
++            .apply()
++    }
++
++    /** Called from Settings, any time after onboarding, to edit name/language. */
++    fun updateProfile(name: String, language: String) = saveIdentity(name, language)
++
++    companion object {
++        private const val PREFS_NAME = "pakkabaat_identity_prefs"
++        private const val KEY_USER_ID = "user_id"
++        private const val KEY_NAME = "name"
++        private const val KEY_LANGUAGE = "language"
++    }
++}
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt b/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt
+index 94e94e3..a50ff5f 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt
+@@ -14,7 +14,6 @@ import androidx.navigation.compose.composable
+ import androidx.navigation.compose.rememberNavController
+ import com.pakkabaat.app.ui.screens.*
+ import com.pakkabaat.app.ui.viewmodel.SessionViewModel
+-import java.util.UUID
+ 
+ private object Routes {
+     const val SPLASH = "splash"
+@@ -35,9 +34,14 @@ fun PakkaBaatNavGraph() {
+     val state by viewModel.uiState.collectAsState()
+     val pastSessions by viewModel.pastSessions.collectAsState(initial = emptyList())
+ 
+-    var chosenLanguage by remember { mutableStateOf("hi") }
++    // SessionViewModel's init block loads any previously-saved identity into uiState
++    // synchronously (SharedPreferences reads are synchronous), before this composable
++    // ever runs, so reading state.value here (not the collected `state`) is safe and
++    // lets returning users skip straight past splash + onboarding.
++    var chosenLanguage by remember { mutableStateOf(state.myLanguage) }
++    val startDestination = if (state.myName.isNotBlank()) Routes.HOME else Routes.SPLASH
+ 
+-    NavHost(navController = navController, startDestination = Routes.SPLASH) {
++    NavHost(navController = navController, startDestination = startDestination) {
+ 
+         composable(Routes.SPLASH) {
+             SplashLanguageScreen(onLanguageChosen = { lang ->
+@@ -49,7 +53,7 @@ fun PakkaBaatNavGraph() {
+         composable(Routes.ONBOARDING) {
+             OnboardingScreen(
+                 onContinue = { name ->
+-                    viewModel.setMyIdentity(userId = UUID.randomUUID().toString(), name = name, language = chosenLanguage)
++                    viewModel.setMyIdentity(name = name, language = chosenLanguage)
+                     navController.navigate(Routes.HOME) { popUpTo(Routes.ONBOARDING) { inclusive = true } }
+                 }
+             )
+@@ -69,7 +73,12 @@ fun PakkaBaatNavGraph() {
+         }
+ 
+         composable(Routes.SETTINGS) {
+-            SettingsScreen(apiKeyStore = viewModel.apiKeyStore)
++            SettingsScreen(
++                apiKeyStore = viewModel.apiKeyStore,
++                currentName = state.myName,
++                currentLanguage = state.myLanguage,
++                onSaveProfile = { name, language -> viewModel.updateMyProfile(name, language) }
++            )
+         }
+ 
+         composable(Routes.START_SESSION) {
+@@ -83,9 +92,11 @@ fun PakkaBaatNavGraph() {
+                 qrToken = state.qrToken,
+                 pairingConnected = state.pairingConnected,
+                 partnerName = state.partnerName,
++                pairingError = state.error,
+                 onBecomeInitiator = { viewModel.startAsInitiator() },
+                 onScannedToken = { token -> viewModel.joinAsScanner(token) },
+-                onContinueToConsent = { navController.navigate(Routes.CONSENT) }
++                onContinueToConsent = { navController.navigate(Routes.CONSENT) },
++                onDismissError = { viewModel.clearPairingError() }
+             )
+         }
+ 
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/screens/SettingsScreen.kt b/app/src/main/java/com/pakkabaat/app/ui/screens/SettingsScreen.kt
+index 83f31a0..bed4182 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/screens/SettingsScreen.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/screens/SettingsScreen.kt
+@@ -3,22 +3,104 @@ package com.pakkabaat.app.ui.screens
+ import androidx.compose.foundation.layout.*
+ import androidx.compose.material3.*
+ import androidx.compose.runtime.*
+-import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.text.input.PasswordVisualTransformation
+-import androidx.compose.ui.unit.dp
++import com.pakkabaat.app.data.model.LanguageCatalog
+ import com.pakkabaat.app.data.repository.ApiKeyStore
+ 
+ @Composable
+-fun SettingsScreen(apiKeyStore: ApiKeyStore) {
++fun SettingsScreen(
++    apiKeyStore: ApiKeyStore,
++    currentName: String,
++    currentLanguage: String,
++    onSaveProfile: (name: String, language: String) -> Unit
++) {
+     var key by remember { mutableStateOf(apiKeyStore.getGeminiKey() ?: "") }
+     var saved by remember { mutableStateOf(false) }
+ 
++    var name by remember(currentName) { mutableStateOf(currentName) }
++    var language by remember(currentLanguage) { mutableStateOf(currentLanguage) }
++    var languageMenuExpanded by remember { mutableStateOf(false) }
++    var profileSaved by remember { mutableStateOf(false) }
++    var nameError by remember { mutableStateOf<String?>(null) }
++
+     Column(Modifier.fillMaxSize().padding(24.dp)) {
+         Text("Settings", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+-        Spacer(Modifier.height(20.dp))
+ 
++        // ---------- Profile: name + language (previously not editable anywhere) ----------
++        Spacer(Modifier.height(24.dp))
++        Text("Your profile", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
++        Spacer(Modifier.height(4.dp))
++        Text(
++            "This is the name the other person sees when you pair up to record.",
++            style = MaterialTheme.typography.bodySmall,
++            color = MaterialTheme.colorScheme.onSurfaceVariant
++        )
++        Spacer(Modifier.height(12.dp))
++
++        OutlinedTextField(
++            value = name,
++            onValueChange = { name = it; nameError = null; profileSaved = false },
++            label = { Text("Your name") },
++            singleLine = true,
++            modifier = Modifier.fillMaxWidth()
++        )
++        nameError?.let {
++            Spacer(Modifier.height(4.dp))
++            Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
++        }
++
++        Spacer(Modifier.height(12.dp))
++        ExposedDropdownMenuBox(
++            expanded = languageMenuExpanded,
++            onExpandedChange = { languageMenuExpanded = it }
++        ) {
++            OutlinedTextField(
++                value = LanguageCatalog.nameFor(language),
++                onValueChange = {},
++                readOnly = true,
++                label = { Text("Preferred language") },
++                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = languageMenuExpanded) },
++                modifier = Modifier.fillMaxWidth().menuAnchor()
++            )
++            ExposedDropdownMenu(
++                expanded = languageMenuExpanded,
++                onDismissRequest = { languageMenuExpanded = false }
++            ) {
++                LanguageCatalog.all.forEach { lang ->
++                    DropdownMenuItem(
++                        text = { Text(lang.displayName) },
++                        onClick = {
++                            language = lang.code
++                            languageMenuExpanded = false
++                            profileSaved = false
++                        }
++                    )
++                }
++            }
++        }
++
++        Spacer(Modifier.height(12.dp))
++        Button(onClick = {
++            if (name.isBlank()) {
++                nameError = "Please enter your name."
++            } else {
++                onSaveProfile(name.trim(), language)
++                profileSaved = true
++            }
++        }) { Text("Save profile") }
++
++        if (profileSaved) {
++            Spacer(Modifier.height(8.dp))
++            Text("Saved.", color = MaterialTheme.colorScheme.primary)
++        }
++
++        HorizontalDivider(Modifier.padding(vertical = 24.dp))
++
++        // ---------- Gemini API key ----------
++        Text("Gemini API key", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
++        Spacer(Modifier.height(12.dp))
+         Text(
+             "This test build asks each person to use their own free Gemini key, so no " +
+                 "shared key gets rate-limited or exposed. Get one at aistudio.google.com/apikey " +
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/screens/StartSessionScreen.kt b/app/src/main/java/com/pakkabaat/app/ui/screens/StartSessionScreen.kt
+index ee2f9cb..b0f9b23 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/screens/StartSessionScreen.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/screens/StartSessionScreen.kt
+@@ -1,8 +1,12 @@
+ package com.pakkabaat.app.ui.screens
+ 
+ import android.Manifest
++import android.app.Activity
++import android.content.Intent
+ import android.graphics.Bitmap
++import android.net.Uri
+ import android.os.Build
++import android.provider.Settings
+ import androidx.activity.compose.rememberLauncherForActivityResult
+ import androidx.activity.result.contract.ActivityResultContracts
+ import androidx.compose.foundation.Image
+@@ -16,6 +20,7 @@ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.text.style.TextAlign
+ import androidx.compose.ui.unit.dp
++import androidx.core.content.ContextCompat
+ import com.journeyapps.barcodescanner.ScanContract
+ import com.journeyapps.barcodescanner.ScanOptions
+ import com.pakkabaat.app.pairing.QrCodeUtil
+@@ -35,28 +40,53 @@ private fun requiredPermissions(): Array<String> {
+     return base.toTypedArray()
+ }
+ 
++private fun allGranted(context: android.content.Context): Boolean =
++    requiredPermissions().all {
++        ContextCompat.checkSelfPermission(context, it) == android.content.pm.PackageManager.PERMISSION_GRANTED
++    }
++
+ @Composable
+ fun StartSessionScreen(
+     qrToken: String?,
+     pairingConnected: Boolean,
+     partnerName: String?,
++    pairingError: String?,
+     onBecomeInitiator: () -> Unit,
+     onScannedToken: (String) -> Unit,
+-    onContinueToConsent: () -> Unit
++    onContinueToConsent: () -> Unit,
++    onDismissError: () -> Unit
+ ) {
+     val context = LocalContext.current
+-    var permissionsGranted by remember { mutableStateOf(false) }
++    val activity = context as? Activity
++    var permissionsGranted by remember { mutableStateOf(allGranted(context)) }
++    // Once the OS has denied a permission and won't show the dialog again (either the
++    // user checked "don't ask again", or denied it twice), shouldShowRequestPermissionRationale
++    // flips to false for that permission *after* a denial — that's our signal that
++    // re-launching the same request will silently no-op, which is the exact "pressing
++    // Grant permissions doesn't do anything" bug: the system re-delivers an instant
++    // denial with no dialog shown at all, so nothing appears to happen.
++    var permanentlyDenied by remember { mutableStateOf(false) }
+     var mode by remember { mutableStateOf<String?>(null) } // "show" or "scan"
+ 
+     val permissionLauncher = rememberLauncherForActivityResult(
+         ActivityResultContracts.RequestMultiplePermissions()
+-    ) { results -> permissionsGranted = results.values.all { it } }
++    ) { results ->
++        permissionsGranted = results.values.all { it }
++        if (!permissionsGranted && activity != null) {
++            val stillDeniedNames = results.filterValues { !it }.keys
++            permanentlyDenied = stillDeniedNames.any { perm ->
++                !activity.shouldShowRequestPermissionRationale(perm)
++            }
++        }
++    }
+ 
+     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+         result.contents?.let { onScannedToken(it) }
+     }
+ 
+-    LaunchedEffect(Unit) { permissionLauncher.launch(requiredPermissions()) }
++    LaunchedEffect(Unit) {
++        if (!permissionsGranted) permissionLauncher.launch(requiredPermissions())
++    }
+ 
+     Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+         Spacer(Modifier.height(16.dp))
+@@ -69,7 +99,31 @@ fun StartSessionScreen(
+                 textAlign = TextAlign.Center
+             )
+             Spacer(Modifier.height(12.dp))
+-            Button(onClick = { permissionLauncher.launch(requiredPermissions()) }) { Text("Grant permissions") }
++            if (permanentlyDenied) {
++                // Re-launching RequestMultiplePermissions here would just silently
++                // re-deny with no dialog — has to go through the system Settings screen.
++                Text(
++                    "One or more permissions were denied and Android won't show the request " +
++                        "again. Open Settings to grant them manually.",
++                    textAlign = TextAlign.Center,
++                    color = MaterialTheme.colorScheme.error
++                )
++                Spacer(Modifier.height(12.dp))
++                Button(onClick = {
++                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
++                        data = Uri.fromParts("package", context.packageName, null)
++                    }
++                    context.startActivity(intent)
++                }) { Text("Open Settings") }
++                Spacer(Modifier.height(8.dp))
++                OutlinedButton(onClick = {
++                    // In case they granted it from Settings and came back.
++                    permissionsGranted = allGranted(context)
++                    if (permissionsGranted) permanentlyDenied = false
++                }) { Text("I granted it — check again") }
++            } else {
++                Button(onClick = { permissionLauncher.launch(requiredPermissions()) }) { Text("Grant permissions") }
++            }
+             return@Column
+         }
+ 
+@@ -80,6 +134,36 @@ fun StartSessionScreen(
+             return@Column
+         }
+ 
++        // Previously, PairingEvent.Error reached SessionUiState.error but nothing in the
++        // UI ever read it — a failed connection (Play services issue, Bluetooth/Wi-Fi off,
++        // endpoint mismatch, etc.) just left the user staring at an infinite spinner with
++        // no explanation and no way to retry. Surfacing it, plus letting them retry the
++        // exact same role, is what actually helps diagnose "can't get 2 phones to connect".
++        pairingError?.let { message ->
++            Card(modifier = Modifier.fillMaxWidth()) {
++                Column(Modifier.padding(16.dp)) {
++                    Text("Connection problem", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
++                    Spacer(Modifier.height(6.dp))
++                    Text(message, style = MaterialTheme.typography.bodySmall)
++                    Spacer(Modifier.height(6.dp))
++                    Text(
++                        "Make sure both phones have Bluetooth and Wi-Fi/Location turned ON " +
++                            "(Nearby Connections needs Location Services enabled on Android, " +
++                            "even though this app never reads your location) and are within a " +
++                            "few metres of each other.",
++                        style = MaterialTheme.typography.bodySmall,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant
++                    )
++                    Spacer(Modifier.height(10.dp))
++                    Button(onClick = {
++                        onDismissError()
++                        mode = null
++                    }) { Text("Try again") }
++                }
++            }
++            Spacer(Modifier.height(16.dp))
++        }
++
+         when (mode) {
+             null -> {
+                 Button(
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt b/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt
+index 7e6ed37..8c5291d 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt
+@@ -7,6 +7,7 @@ import com.pakkabaat.app.consent.stopTimeoutCountdown
+ import com.pakkabaat.app.data.db.*
+ import com.pakkabaat.app.data.model.*
+ import com.pakkabaat.app.data.repository.ApiKeyStore
++import com.pakkabaat.app.data.repository.IdentityStore
+ import com.pakkabaat.app.pairing.NearbyPairingManager
+ import com.pakkabaat.app.pairing.PairingEvent
+ import com.pakkabaat.app.pairing.SessionMessage
+@@ -54,10 +55,27 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+     private val recorder = AudioRecorderManager(application)
+     private val onDeviceTranscriber: OnDeviceTranscriber = WhisperCppTranscriber(application)
+     val apiKeyStore = ApiKeyStore(application)
++    val identityStore = IdentityStore(application)
+ 
+     private val _uiState = MutableStateFlow(SessionUiState())
+     val uiState: StateFlow<SessionUiState> = _uiState.asStateFlow()
+ 
++    init {
++        // Load any previously-saved identity synchronously, before NavGraph reads
++        // uiState.value to pick a start destination — this is what actually fixes
++        // "no persistence for name/language": without it, every process restart
++        // wiped myName/myLanguage back to blank/"hi" and forced onboarding again.
++        if (identityStore.hasIdentity()) {
++            _uiState.update {
++                it.copy(
++                    myUserId = identityStore.getUserId(),
++                    myName = identityStore.getName().orEmpty(),
++                    myLanguage = identityStore.getLanguage()
++                )
++            }
++        }
++    }
++
+     val pastSessions: Flow<List<SessionEntity>> = db.sessionDao().observeAll()
+ 
+     private var pairingJob: Job? = null
+@@ -67,8 +85,20 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+ 
+     // ---------- Onboarding (spec 8.1) ----------
+ 
+-    fun setMyIdentity(userId: String, name: String, language: String) {
+-        _uiState.update { it.copy(myUserId = userId, myName = name, myLanguage = language) }
++    fun setMyIdentity(name: String, language: String) {
++        identityStore.saveIdentity(name, language)
++        // Reuse the userId IdentityStore persists (generating it once, lazily, on first
++        // call) rather than a fresh UUID per call — otherwise "myUserId" would silently
++        // change on every process restart even after name/language start persisting.
++        _uiState.update { it.copy(myUserId = identityStore.getUserId(), myName = name, myLanguage = language) }
++    }
++
++    /** Settings screen: edit name/language after onboarding. Keeps the same userId so
++     *  past sessions in the DB (keyed by userId) still resolve to this identity. */
++    fun updateMyProfile(name: String, language: String) {
++        val trimmed = name.trim()
++        identityStore.updateProfile(trimmed, language)
++        _uiState.update { it.copy(myName = trimmed, myLanguage = language) }
+     }
+ 
+     // ---------- Starting a session, in-person mode (spec 8.2) ----------
+@@ -119,6 +149,10 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+         }
+     }
+ 
++    fun clearPairingError() {
++        _uiState.update { it.copy(error = null) }
++    }
++
+     private fun listenOnPairingChannel(sessionToken: String, isAdvertiser: Boolean) {
+         pairingJob?.cancel()
+         pairingJob = viewModelScope.launch {

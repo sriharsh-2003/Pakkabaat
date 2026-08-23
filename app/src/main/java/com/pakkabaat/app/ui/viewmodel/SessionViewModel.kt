@@ -7,6 +7,7 @@ import com.pakkabaat.app.consent.stopTimeoutCountdown
 import com.pakkabaat.app.data.db.*
 import com.pakkabaat.app.data.model.*
 import com.pakkabaat.app.data.repository.ApiKeyStore
+import com.pakkabaat.app.data.repository.IdentityStore
 import com.pakkabaat.app.pairing.NearbyPairingManager
 import com.pakkabaat.app.pairing.PairingEvent
 import com.pakkabaat.app.pairing.SessionMessage
@@ -54,9 +55,26 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
     private val recorder = AudioRecorderManager(application)
     private val onDeviceTranscriber: OnDeviceTranscriber = WhisperCppTranscriber(application)
     val apiKeyStore = ApiKeyStore(application)
+    val identityStore = IdentityStore(application)
 
     private val _uiState = MutableStateFlow(SessionUiState())
     val uiState: StateFlow<SessionUiState> = _uiState.asStateFlow()
+
+    init {
+        // Load any previously-saved identity synchronously, before NavGraph reads
+        // uiState.value to pick a start destination — this is what actually fixes
+        // "no persistence for name/language": without it, every process restart
+        // wiped myName/myLanguage back to blank/"hi" and forced onboarding again.
+        if (identityStore.hasIdentity()) {
+            _uiState.update {
+                it.copy(
+                    myUserId = identityStore.getUserId(),
+                    myName = identityStore.getName().orEmpty(),
+                    myLanguage = identityStore.getLanguage()
+                )
+            }
+        }
+    }
 
     val pastSessions: Flow<List<SessionEntity>> = db.sessionDao().observeAll()
 
@@ -67,8 +85,20 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
 
     // ---------- Onboarding (spec 8.1) ----------
 
-    fun setMyIdentity(userId: String, name: String, language: String) {
-        _uiState.update { it.copy(myUserId = userId, myName = name, myLanguage = language) }
+    fun setMyIdentity(name: String, language: String) {
+        identityStore.saveIdentity(name, language)
+        // Reuse the userId IdentityStore persists (generating it once, lazily, on first
+        // call) rather than a fresh UUID per call — otherwise "myUserId" would silently
+        // change on every process restart even after name/language start persisting.
+        _uiState.update { it.copy(myUserId = identityStore.getUserId(), myName = name, myLanguage = language) }
+    }
+
+    /** Settings screen: edit name/language after onboarding. Keeps the same userId so
+     *  past sessions in the DB (keyed by userId) still resolve to this identity. */
+    fun updateMyProfile(name: String, language: String) {
+        val trimmed = name.trim()
+        identityStore.updateProfile(trimmed, language)
+        _uiState.update { it.copy(myName = trimmed, myLanguage = language) }
     }
 
     // ---------- Starting a session, in-person mode (spec 8.2) ----------
@@ -117,6 +147,10 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
                 myConsent = false, otherConsent = false
             )
         }
+    }
+
+    fun clearPairingError() {
+        _uiState.update { it.copy(error = null) }
     }
 
     private fun listenOnPairingChannel(sessionToken: String, isAdvertiser: Boolean) {

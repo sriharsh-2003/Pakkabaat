@@ -1,8 +1,12 @@
 package com.pakkabaat.app.ui.screens
 
 import android.Manifest
+import android.app.Activity
+import android.content.Intent
 import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -16,6 +20,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import com.pakkabaat.app.pairing.QrCodeUtil
@@ -35,28 +40,53 @@ private fun requiredPermissions(): Array<String> {
     return base.toTypedArray()
 }
 
+private fun allGranted(context: android.content.Context): Boolean =
+    requiredPermissions().all {
+        ContextCompat.checkSelfPermission(context, it) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
+
 @Composable
 fun StartSessionScreen(
     qrToken: String?,
     pairingConnected: Boolean,
     partnerName: String?,
+    pairingError: String?,
     onBecomeInitiator: () -> Unit,
     onScannedToken: (String) -> Unit,
-    onContinueToConsent: () -> Unit
+    onContinueToConsent: () -> Unit,
+    onDismissError: () -> Unit
 ) {
     val context = LocalContext.current
-    var permissionsGranted by remember { mutableStateOf(false) }
+    val activity = context as? Activity
+    var permissionsGranted by remember { mutableStateOf(allGranted(context)) }
+    // Once the OS has denied a permission and won't show the dialog again (either the
+    // user checked "don't ask again", or denied it twice), shouldShowRequestPermissionRationale
+    // flips to false for that permission *after* a denial — that's our signal that
+    // re-launching the same request will silently no-op, which is the exact "pressing
+    // Grant permissions doesn't do anything" bug: the system re-delivers an instant
+    // denial with no dialog shown at all, so nothing appears to happen.
+    var permanentlyDenied by remember { mutableStateOf(false) }
     var mode by remember { mutableStateOf<String?>(null) } // "show" or "scan"
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { results -> permissionsGranted = results.values.all { it } }
+    ) { results ->
+        permissionsGranted = results.values.all { it }
+        if (!permissionsGranted && activity != null) {
+            val stillDeniedNames = results.filterValues { !it }.keys
+            permanentlyDenied = stillDeniedNames.any { perm ->
+                !activity.shouldShowRequestPermissionRationale(perm)
+            }
+        }
+    }
 
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         result.contents?.let { onScannedToken(it) }
     }
 
-    LaunchedEffect(Unit) { permissionLauncher.launch(requiredPermissions()) }
+    LaunchedEffect(Unit) {
+        if (!permissionsGranted) permissionLauncher.launch(requiredPermissions())
+    }
 
     Column(Modifier.fillMaxSize().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Spacer(Modifier.height(16.dp))
@@ -69,7 +99,31 @@ fun StartSessionScreen(
                 textAlign = TextAlign.Center
             )
             Spacer(Modifier.height(12.dp))
-            Button(onClick = { permissionLauncher.launch(requiredPermissions()) }) { Text("Grant permissions") }
+            if (permanentlyDenied) {
+                // Re-launching RequestMultiplePermissions here would just silently
+                // re-deny with no dialog — has to go through the system Settings screen.
+                Text(
+                    "One or more permissions were denied and Android won't show the request " +
+                        "again. Open Settings to grant them manually.",
+                    textAlign = TextAlign.Center,
+                    color = MaterialTheme.colorScheme.error
+                )
+                Spacer(Modifier.height(12.dp))
+                Button(onClick = {
+                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.fromParts("package", context.packageName, null)
+                    }
+                    context.startActivity(intent)
+                }) { Text("Open Settings") }
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(onClick = {
+                    // In case they granted it from Settings and came back.
+                    permissionsGranted = allGranted(context)
+                    if (permissionsGranted) permanentlyDenied = false
+                }) { Text("I granted it — check again") }
+            } else {
+                Button(onClick = { permissionLauncher.launch(requiredPermissions()) }) { Text("Grant permissions") }
+            }
             return@Column
         }
 
@@ -78,6 +132,36 @@ fun StartSessionScreen(
             Spacer(Modifier.height(16.dp))
             Button(onClick = onContinueToConsent, modifier = Modifier.fillMaxWidth()) { Text("Continue") }
             return@Column
+        }
+
+        // Previously, PairingEvent.Error reached SessionUiState.error but nothing in the
+        // UI ever read it — a failed connection (Play services issue, Bluetooth/Wi-Fi off,
+        // endpoint mismatch, etc.) just left the user staring at an infinite spinner with
+        // no explanation and no way to retry. Surfacing it, plus letting them retry the
+        // exact same role, is what actually helps diagnose "can't get 2 phones to connect".
+        pairingError?.let { message ->
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Connection problem", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+                    Spacer(Modifier.height(6.dp))
+                    Text(message, style = MaterialTheme.typography.bodySmall)
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "Make sure both phones have Bluetooth and Wi-Fi/Location turned ON " +
+                            "(Nearby Connections needs Location Services enabled on Android, " +
+                            "even though this app never reads your location) and are within a " +
+                            "few metres of each other.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Button(onClick = {
+                        onDismissError()
+                        mode = null
+                    }) { Text("Try again") }
+                }
+            }
+            Spacer(Modifier.height(16.dp))
         }
 
         when (mode) {

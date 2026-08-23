@@ -14,7 +14,6 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.pakkabaat.app.ui.screens.*
 import com.pakkabaat.app.ui.viewmodel.SessionViewModel
-import java.util.UUID
 
 private object Routes {
     const val SPLASH = "splash"
@@ -35,9 +34,14 @@ fun PakkaBaatNavGraph() {
     val state by viewModel.uiState.collectAsState()
     val pastSessions by viewModel.pastSessions.collectAsState(initial = emptyList())
 
-    var chosenLanguage by remember { mutableStateOf("hi") }
+    // SessionViewModel's init block loads any previously-saved identity into uiState
+    // synchronously (SharedPreferences reads are synchronous), before this composable
+    // ever runs, so reading state.value here (not the collected `state`) is safe and
+    // lets returning users skip straight past splash + onboarding.
+    var chosenLanguage by remember { mutableStateOf(state.myLanguage) }
+    val startDestination = if (state.myName.isNotBlank()) Routes.HOME else Routes.SPLASH
 
-    NavHost(navController = navController, startDestination = Routes.SPLASH) {
+    NavHost(navController = navController, startDestination = startDestination) {
 
         composable(Routes.SPLASH) {
             SplashLanguageScreen(onLanguageChosen = { lang ->
@@ -49,7 +53,7 @@ fun PakkaBaatNavGraph() {
         composable(Routes.ONBOARDING) {
             OnboardingScreen(
                 onContinue = { name ->
-                    viewModel.setMyIdentity(userId = UUID.randomUUID().toString(), name = name, language = chosenLanguage)
+                    viewModel.setMyIdentity(name = name, language = chosenLanguage)
                     navController.navigate(Routes.HOME) { popUpTo(Routes.ONBOARDING) { inclusive = true } }
                 }
             )
@@ -69,7 +73,12 @@ fun PakkaBaatNavGraph() {
         }
 
         composable(Routes.SETTINGS) {
-            SettingsScreen(apiKeyStore = viewModel.apiKeyStore)
+            SettingsScreen(
+                apiKeyStore = viewModel.apiKeyStore,
+                currentName = state.myName,
+                currentLanguage = state.myLanguage,
+                onSaveProfile = { name, language -> viewModel.updateMyProfile(name, language) }
+            )
         }
 
         composable(Routes.START_SESSION) {
@@ -83,9 +92,11 @@ fun PakkaBaatNavGraph() {
                 qrToken = state.qrToken,
                 pairingConnected = state.pairingConnected,
                 partnerName = state.partnerName,
+                pairingError = state.error,
                 onBecomeInitiator = { viewModel.startAsInitiator() },
                 onScannedToken = { token -> viewModel.joinAsScanner(token) },
-                onContinueToConsent = { navController.navigate(Routes.CONSENT) }
+                onContinueToConsent = { navController.navigate(Routes.CONSENT) },
+                onDismissError = { viewModel.clearPairingError() }
             )
         }
 

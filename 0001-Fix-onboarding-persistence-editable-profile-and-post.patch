@@ -1,0 +1,424 @@
+From 77786b71d7256e45e1fd3de592fb167385f22b76 Mon Sep 17 00:00:00 2001
+From: SRI <sri@example.com>
+Date: Sun, 23 Aug 2026 11:26:45 +0000
+Subject: [PATCH] Fix onboarding persistence, editable profile, and
+ post-recording workflow
+
+- SessionViewModel now checks for a saved UserEntity on launch and
+  restores myUserId/myName/myLanguage from Room instead of always
+  starting fresh (setMyIdentity previously only wrote to in-memory
+  StateFlow, so language + name were lost, and the app looked stuck
+  re-showing the language screen on every restart).
+- setMyIdentity now persists the user record (added the missing
+  phoneNumber param, wired through from OnboardingScreen).
+- Added updateMyProfile() plus an edit-profile dialog on HomeScreen,
+  since there was previously no way to change a saved name/language.
+- NavGraph's splash route now waits for that check before deciding
+  whether to show language selection or skip straight to Home.
+- Fixed a stale-state bug in the recording workflow: starting a
+  second session reused the previous session's pairingConnected/
+  myConsent/document/etc. from SessionUiState, which could skip
+  pairing/consent entirely or jump straight to the prior document.
+  Added resetForNewSession() called from startAsInitiator/
+  joinAsScanner, and cancel the previous document-observer Job so
+  an old session's Room updates can't overwrite current state.
+- Fixed back-stack: Start Session is now popped when continuing to
+  Consent, and DocumentScreen has an explicit Back to Home action,
+  so leaving a finished record lands on Home instead of a stale
+  pairing screen.
+---
+ .../pakkabaat/app/ui/navigation/NavGraph.kt   | 62 ++++++++++---
+ .../app/ui/screens/DocumentScreen.kt          |  8 +-
+ .../pakkabaat/app/ui/screens/HomeScreen.kt    | 87 ++++++++++++++++++-
+ .../app/ui/viewmodel/SessionViewModel.kt      | 84 +++++++++++++++++-
+ 4 files changed, 223 insertions(+), 18 deletions(-)
+
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt b/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt
+index 1d5a071..d25405e 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt
+@@ -1,5 +1,8 @@
+ package com.pakkabaat.app.ui.navigation
+ 
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.material3.CircularProgressIndicator
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.collectAsState
+@@ -7,6 +10,8 @@ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
+ import androidx.lifecycle.viewmodel.compose.viewModel
+ import androidx.navigation.NavHostController
+ import androidx.navigation.compose.NavHost
+@@ -39,17 +44,36 @@ fun PakkaBaatNavGraph() {
+     NavHost(navController = navController, startDestination = Routes.SPLASH) {
+ 
+         composable(Routes.SPLASH) {
+-            SplashLanguageScreen(onLanguageChosen = { lang ->
+-                chosenLanguage = lang
+-                navController.navigate(Routes.ONBOARDING) { popUpTo(Routes.SPLASH) { inclusive = true } }
+-            })
++            // Check once, on launch, whether this device already has a saved user
++            // (Room, persisted by setMyIdentity). If so, skip straight to Home instead
++            // of forcing language selection + onboarding again on every app restart.
++            val identityReady by viewModel.identityReady.collectAsState()
++            LaunchedEffect(identityReady) {
++                if (identityReady == true) {
++                    navController.navigate(Routes.HOME) { popUpTo(Routes.SPLASH) { inclusive = true } }
++                }
++            }
++            when (identityReady) {
++                null, true -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
++                    CircularProgressIndicator()
++                }
++                false -> SplashLanguageScreen(onLanguageChosen = { lang ->
++                    chosenLanguage = lang
++                    navController.navigate(Routes.ONBOARDING) { popUpTo(Routes.SPLASH) { inclusive = true } }
++                })
++            }
+         }
+ 
+         composable(Routes.ONBOARDING) {
+             OnboardingScreen(
+                 otpService = viewModel.otpService,
+-                onVerified = { _, name ->
+-                    viewModel.setMyIdentity(userId = UUID.randomUUID().toString(), name = name, language = chosenLanguage)
++                onVerified = { phone, name ->
++                    viewModel.setMyIdentity(
++                        userId = UUID.randomUUID().toString(),
++                        name = name,
++                        language = chosenLanguage,
++                        phoneNumber = phone
++                    )
+                     navController.navigate(Routes.HOME) { popUpTo(Routes.ONBOARDING) { inclusive = true } }
+                 }
+             )
+@@ -58,26 +82,29 @@ fun PakkaBaatNavGraph() {
+         composable(Routes.HOME) {
+             HomeScreen(
+                 sessions = pastSessions,
++                myName = state.myName,
++                myLanguage = state.myLanguage,
+                 onRecordNew = { navController.navigate(Routes.START_SESSION) },
+                 onOpenSession = { sessionId ->
+                     viewModel.loadExistingSession(sessionId)
+                     navController.navigate(Routes.DOCUMENT)
+-                }
++                },
++                onUpdateProfile = { name, language -> viewModel.updateMyProfile(name, language) }
+             )
+         }
+ 
+         composable(Routes.START_SESSION) {
+-            // Auto-advance once both this device's consent state machine is ready.
+-            LaunchedEffect(state.pairingConnected) {
+-                // no-op; navigation to consent is via the explicit "Continue" tap below
+-            }
+             StartSessionScreen(
+                 qrToken = state.qrToken,
+                 pairingConnected = state.pairingConnected,
+                 partnerName = state.partnerName,
+                 onBecomeInitiator = { viewModel.startAsInitiator() },
+                 onScannedToken = { token -> viewModel.joinAsScanner(token) },
+-                onContinueToConsent = { navController.navigate(Routes.CONSENT) }
++                onContinueToConsent = {
++                    // Pop Start Session off the back stack so the flow (and the Android
++                    // back button afterward) can't return to a stale pairing screen.
++                    navController.navigate(Routes.CONSENT) { popUpTo(Routes.START_SESSION) { inclusive = true } }
++                }
+             )
+         }
+ 
+@@ -123,7 +150,16 @@ fun PakkaBaatNavGraph() {
+         }
+ 
+         composable(Routes.DOCUMENT) {
+-            DocumentScreen(document = state.document, certificate = state.certificate)
++            DocumentScreen(
++                document = state.document,
++                certificate = state.certificate,
++                onDone = {
++                    navController.navigate(Routes.HOME) {
++                        popUpTo(Routes.HOME) { inclusive = true }
++                        launchSingleTop = true
++                    }
++                }
++            )
+         }
+     }
+ }
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/screens/DocumentScreen.kt b/app/src/main/java/com/pakkabaat/app/ui/screens/DocumentScreen.kt
+index 13d1327..5b0ac03 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/screens/DocumentScreen.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/screens/DocumentScreen.kt
+@@ -18,7 +18,8 @@ import com.pakkabaat.app.pdf.PdfExporter
+ @Composable
+ fun DocumentScreen(
+     document: StructuredDocumentEntity?,
+-    certificate: CertificateEntity?
++    certificate: CertificateEntity?,
++    onDone: () -> Unit
+ ) {
+     val context = LocalContext.current
+     var proofExpanded by remember { mutableStateOf(false) }
+@@ -67,5 +68,10 @@ fun DocumentScreen(
+                 }
+             }
+         }
++
++        Spacer(Modifier.height(20.dp))
++        OutlinedButton(onClick = onDone, modifier = Modifier.fillMaxWidth()) {
++            Text("Back to home")
++        }
+     }
+ }
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/screens/HomeScreen.kt b/app/src/main/java/com/pakkabaat/app/ui/screens/HomeScreen.kt
+index 6983a34..135f506 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/screens/HomeScreen.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/screens/HomeScreen.kt
+@@ -5,6 +5,7 @@ import androidx.compose.foundation.lazy.LazyColumn
+ import androidx.compose.foundation.lazy.items
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.filled.Add
++import androidx.compose.material.icons.filled.Edit
+ import androidx.compose.material3.*
+ import androidx.compose.runtime.*
+ import androidx.compose.ui.Alignment
+@@ -12,6 +13,7 @@ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.unit.dp
+ import com.pakkabaat.app.data.db.SessionEntity
++import com.pakkabaat.app.data.model.LanguageCatalog
+ import com.pakkabaat.app.data.model.SessionStatus
+ import java.text.SimpleDateFormat
+ import java.util.*
+@@ -19,11 +21,32 @@ import java.util.*
+ @Composable
+ fun HomeScreen(
+     sessions: List<SessionEntity>,
++    myName: String,
++    myLanguage: String,
+     onRecordNew: () -> Unit,
+-    onOpenSession: (String) -> Unit
++    onOpenSession: (String) -> Unit,
++    onUpdateProfile: (name: String, language: String) -> Unit
+ ) {
++    var editingProfile by remember { mutableStateOf(false) }
++
+     Column(Modifier.fillMaxSize().padding(20.dp)) {
+-        Text("Your agreements", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
++        Row(
++            Modifier.fillMaxWidth(),
++            horizontalArrangement = Arrangement.SpaceBetween,
++            verticalAlignment = Alignment.CenterVertically
++        ) {
++            Column {
++                Text("Your agreements", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
++                Text(
++                    myName.ifBlank { "Set your name" },
++                    style = MaterialTheme.typography.bodyMedium,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant
++                )
++            }
++            IconButton(onClick = { editingProfile = true }) {
++                Icon(Icons.Default.Edit, contentDescription = "Edit your name or language")
++            }
++        }
+         Spacer(Modifier.height(16.dp))
+         Button(onClick = onRecordNew, modifier = Modifier.fillMaxWidth()) {
+             Icon(Icons.Default.Add, contentDescription = null)
+@@ -67,6 +90,66 @@ fun HomeScreen(
+             }
+         }
+     }
++
++    if (editingProfile) {
++        var draftName by remember(myName) { mutableStateOf(myName) }
++        var draftLanguage by remember(myLanguage) { mutableStateOf(myLanguage) }
++        var languageMenuExpanded by remember { mutableStateOf(false) }
++
++        AlertDialog(
++            onDismissRequest = { editingProfile = false },
++            title = { Text("Edit your details") },
++            text = {
++                Column {
++                    OutlinedTextField(
++                        value = draftName,
++                        onValueChange = { draftName = it },
++                        label = { Text("Your name") },
++                        modifier = Modifier.fillMaxWidth()
++                    )
++                    Spacer(Modifier.height(12.dp))
++                    Box {
++                        OutlinedTextField(
++                            value = LanguageCatalog.nameFor(draftLanguage),
++                            onValueChange = {},
++                            readOnly = true,
++                            label = { Text("Language") },
++                            modifier = Modifier.fillMaxWidth(),
++                            trailingIcon = {
++                                IconButton(onClick = { languageMenuExpanded = true }) {
++                                    Icon(Icons.Default.Edit, contentDescription = "Change language")
++                                }
++                            }
++                        )
++                        DropdownMenu(expanded = languageMenuExpanded, onDismissRequest = { languageMenuExpanded = false }) {
++                            LanguageCatalog.all.forEach { lang ->
++                                DropdownMenuItem(
++                                    text = { Text(lang.displayName) },
++                                    onClick = {
++                                        draftLanguage = lang.code
++                                        languageMenuExpanded = false
++                                    }
++                                )
++                            }
++                        }
++                    }
++                }
++            },
++            confirmButton = {
++                TextButton(
++                    onClick = {
++                        if (draftName.isNotBlank()) {
++                            onUpdateProfile(draftName, draftLanguage)
++                            editingProfile = false
++                        }
++                    }
++                ) { Text("Save") }
++            },
++            dismissButton = {
++                TextButton(onClick = { editingProfile = false }) { Text("Cancel") }
++            }
++        )
++    }
+ }
+ 
+ private fun statusLabel(status: SessionStatus): String = when (status) {
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt b/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt
+index fcca068..839d7a7 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt
+@@ -62,18 +62,96 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+     private var pairingJob: Job? = null
+     private var tickerJob: Job? = null
+     private var stopTimeoutJob: Job? = null
++    private var documentObserverJob: Job? = null
+     private var currentRecordingId: String? = null
+ 
++    // ---------- Returning-user check (fixes: no persistence of language/name) ----------
++    // null = still checking Room; true = a saved user was found and myUserId/myName/
++    // myLanguage above are already populated from it; false = no saved user, onboarding needed.
++    private val _identityReady = MutableStateFlow<Boolean?>(null)
++    val identityReady: StateFlow<Boolean?> = _identityReady.asStateFlow()
++
++    init {
++        viewModelScope.launch {
++            val existing = db.userDao().getFirstUser()
++            if (existing != null) {
++                _uiState.update {
++                    it.copy(myUserId = existing.userId, myName = existing.name, myLanguage = existing.preferredLanguage)
++                }
++                _identityReady.value = true
++            } else {
++                _identityReady.value = false
++            }
++        }
++    }
++
+     // ---------- Onboarding (spec 8.1) ----------
+ 
+-    fun setMyIdentity(userId: String, name: String, language: String) {
++    /** First-time onboarding: creates and persists the local user record. */
++    fun setMyIdentity(userId: String, name: String, language: String, phoneNumber: String) {
+         _uiState.update { it.copy(myUserId = userId, myName = name, myLanguage = language) }
++        viewModelScope.launch {
++            db.userDao().upsert(
++                UserEntity(
++                    userId = userId,
++                    phoneNumber = phoneNumber,
++                    name = name,
++                    preferredLanguage = language,
++                    createdAt = System.currentTimeMillis()
++                )
++            )
++        }
++    }
++
++    /** Lets a returning user edit their saved name/language later (fixes: name couldn't be changed). */
++    fun updateMyProfile(name: String, language: String) {
++        _uiState.update { it.copy(myName = name, myLanguage = language) }
++        viewModelScope.launch {
++            db.userDao().getById(_uiState.value.myUserId)?.let { existing ->
++                db.userDao().upsert(existing.copy(name = name, preferredLanguage = language))
++            }
++        }
+     }
+ 
+     // ---------- Starting a session, in-person mode (spec 8.2) ----------
+ 
++    /**
++     * Clears everything left over from a previous session before starting the next one.
++     * Without this, a second "Record a new agreement" run would reuse the prior session's
++     * pairingConnected/myConsent/document etc., which broke the post-recording workflow
++     * (e.g. jumping straight to the old document, or skipping consent/pairing entirely).
++     */
++    private fun resetForNewSession() {
++        documentObserverJob?.cancel()
++        tickerJob?.cancel()
++        stopTimeoutJob?.cancel()
++        _uiState.update {
++            it.copy(
++                sessionId = "",
++                qrToken = null,
++                pairingConnected = false,
++                partnerName = null,
++                myConsent = false,
++                otherConsent = false,
++                isRecording = false,
++                elapsedSeconds = 0,
++                stopRequestedByMe = false,
++                stopRequestedByOtherName = null,
++                stopTimeoutRemaining = null,
++                stopViaTimeout = false,
++                draftTranscript = null,
++                draftIsPlaceholder = false,
++                processing = false,
++                document = null,
++                certificate = null,
++                error = null
++            )
++        }
++    }
++
+     /** Party A: create a new session and start advertising nearby for Party B to scan+join. */
+     fun startAsInitiator() {
++        resetForNewSession()
+         val sessionId = UUID.randomUUID().toString()
+         _uiState.update {
+             it.copy(sessionId = sessionId, role = PartyRole.PARTY_A, qrToken = sessionId, pairingConnected = false)
+@@ -102,6 +180,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+ 
+     /** Party B: after scanning Party A's QR code, join that specific session. */
+     fun joinAsScanner(scannedSessionToken: String) {
++        resetForNewSession()
+         _uiState.update {
+             it.copy(sessionId = scannedSessionToken, role = PartyRole.PARTY_B, qrToken = null, pairingConnected = false)
+         }
+@@ -309,7 +388,8 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+     }
+ 
+     private fun observeDocumentReady(sessionId: String) {
+-        viewModelScope.launch {
++        documentObserverJob?.cancel()
++        documentObserverJob = viewModelScope.launch {
+             db.structuredDocumentDao().observeForSession(sessionId).collect { doc ->
+                 if (doc != null) {
+                     val cert = db.certificateDao().forDocument(doc.documentId)
+-- 
+2.43.0
+
