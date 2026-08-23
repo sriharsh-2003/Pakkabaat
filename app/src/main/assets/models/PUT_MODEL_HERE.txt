@@ -1,0 +1,11 @@
+Put ggml-base-q5_1.bin here (the multilingual, Q5_1-quantized Whisper base model, ~57MB).
+
+Download it with:
+  curl -L -o ggml-base-q5_1.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin
+
+Or use the tiny model instead (~32MB, faster, less accurate) if you want more size headroom:
+  curl -L -o ggml-tiny-q5_1.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny-q5_1.bin
+  (then update MODEL_FILENAME in WhisperCppTranscriber.kt to match)
+
+Delete this file once the real model is in place — it's just a marker so the folder
+isn't empty (git doesn't track empty directories).
