@@ -17,10 +17,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import com.pakkabaat.app.pairing.QrCodeUtil
@@ -40,10 +43,24 @@ private fun requiredPermissions(): Array<String> {
     return base.toTypedArray()
 }
 
-private fun allGranted(context: android.content.Context): Boolean =
-    requiredPermissions().all {
-        ContextCompat.checkSelfPermission(context, it) == android.content.pm.PackageManager.PERMISSION_GRANTED
+private fun deniedPermissions(context: android.content.Context): List<String> =
+    requiredPermissions().filter {
+        ContextCompat.checkSelfPermission(context, it) != android.content.pm.PackageManager.PERMISSION_GRANTED
     }
+
+// Human-readable label for whichever permission(s) are still missing, so the screen can
+// say exactly what's blocking it instead of a generic "still not granted" dead end.
+private fun permissionLabel(permission: String): String = when (permission) {
+    Manifest.permission.RECORD_AUDIO -> "Microphone"
+    Manifest.permission.CAMERA -> "Camera"
+    Manifest.permission.ACCESS_FINE_LOCATION -> "Location"
+    Manifest.permission.BLUETOOTH_ADVERTISE -> "Nearby devices (advertise)"
+    Manifest.permission.BLUETOOTH_CONNECT -> "Nearby devices (connect)"
+    Manifest.permission.BLUETOOTH_SCAN -> "Nearby devices (scan)"
+    Manifest.permission.NEARBY_WIFI_DEVICES -> "Nearby Wi-Fi devices"
+    Manifest.permission.POST_NOTIFICATIONS -> "Notifications"
+    else -> permission.substringAfterLast('.')
+}
 
 @Composable
 fun StartSessionScreen(
@@ -58,7 +75,9 @@ fun StartSessionScreen(
 ) {
     val context = LocalContext.current
     val activity = context as? Activity
-    var permissionsGranted by remember { mutableStateOf(allGranted(context)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var missingPermissions by remember { mutableStateOf(deniedPermissions(context)) }
+    val permissionsGranted = missingPermissions.isEmpty()
     // Once the OS has denied a permission and won't show the dialog again (either the
     // user checked "don't ask again", or denied it twice), shouldShowRequestPermissionRationale
     // flips to false for that permission *after* a denial — that's our signal that
@@ -71,13 +90,30 @@ fun StartSessionScreen(
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
-        permissionsGranted = results.values.all { it }
-        if (!permissionsGranted && activity != null) {
-            val stillDeniedNames = results.filterValues { !it }.keys
-            permanentlyDenied = stillDeniedNames.any { perm ->
+        missingPermissions = results.filterValues { !it }.keys.toList()
+        if (missingPermissions.isNotEmpty() && activity != null) {
+            permanentlyDenied = missingPermissions.any { perm ->
                 !activity.shouldShowRequestPermissionRationale(perm)
             }
         }
+    }
+
+    // "Allow once" (one-time) grants for camera/mic/location can be silently revoked by
+    // Android once the app leaves the foreground for any reason — including the QR
+    // scanner opening its own Activity, or the user briefly switching to Settings. The
+    // launcher callback above only fires right after the system dialog closes, so without
+    // this, a later revocation just leaves the screen stuck with no way to notice or
+    // recover. Re-checking on every resume catches that and any other external change.
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val stillMissing = deniedPermissions(context)
+                missingPermissions = stillMissing
+                if (stillMissing.isEmpty()) permanentlyDenied = false
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
@@ -98,13 +134,22 @@ fun StartSessionScreen(
                 "PakkaBaat needs microphone, camera, and nearby-device permissions to pair and record.",
                 textAlign = TextAlign.Center
             )
+            Spacer(Modifier.height(8.dp))
+            // Named explicitly, instead of a generic blocked state, so it's obvious exactly
+            // which permission(s) are still missing rather than a silent dead end.
+            Text(
+                "Still needed: " + missingPermissions.joinToString(", ") { permissionLabel(it) },
+                textAlign = TextAlign.Center,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error
+            )
             Spacer(Modifier.height(12.dp))
             if (permanentlyDenied) {
                 // Re-launching RequestMultiplePermissions here would just silently
                 // re-deny with no dialog — has to go through the system Settings screen.
                 Text(
-                    "One or more permissions were denied and Android won't show the request " +
-                        "again. Open Settings to grant them manually.",
+                    "Android won't show the request again for one or more of these. Open " +
+                        "Settings to grant them manually.",
                     textAlign = TextAlign.Center,
                     color = MaterialTheme.colorScheme.error
                 )
@@ -117,9 +162,10 @@ fun StartSessionScreen(
                 }) { Text("Open Settings") }
                 Spacer(Modifier.height(8.dp))
                 OutlinedButton(onClick = {
-                    // In case they granted it from Settings and came back.
-                    permissionsGranted = allGranted(context)
-                    if (permissionsGranted) permanentlyDenied = false
+                    // In case they granted it from Settings and came back. (The ON_RESUME
+                    // check above also catches this automatically when this screen resumes.)
+                    missingPermissions = deniedPermissions(context)
+                    if (missingPermissions.isEmpty()) permanentlyDenied = false
                 }) { Text("I granted it — check again") }
             } else {
                 Button(onClick = { permissionLauncher.launch(requiredPermissions()) }) { Text("Grant permissions") }
