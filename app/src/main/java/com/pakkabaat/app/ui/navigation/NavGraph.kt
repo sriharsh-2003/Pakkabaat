@@ -1,6 +1,9 @@
 package com.pakkabaat.app.ui.navigation
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -118,6 +121,28 @@ fun PakkaBaatNavGraph() {
         }
 
         composable(Routes.RECORDING) {
+            // Recording previously had no BackHandler at all, so a system back press
+            // silently dropped out of the screen mid-recording with no confirmation and
+            // no way to just keep recording while stepping away. This intercepts back,
+            // asks once, and only stops if the person says so.
+            var showExitConfirm by remember { mutableStateOf(false) }
+            BackHandler(enabled = state.isRecording) { showExitConfirm = true }
+            if (showExitConfirm) {
+                AlertDialog(
+                    onDismissRequest = { showExitConfirm = false },
+                    title = { Text("End recording?") },
+                    text = { Text("Going back won't stop the recording. Do you want to end it now, or keep recording?") },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            showExitConfirm = false
+                            viewModel.requestStop()
+                        }) { Text("End recording") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showExitConfirm = false }) { Text("Keep recording") }
+                    }
+                )
+            }
             RecordingScreen(
                 elapsedSeconds = state.elapsedSeconds,
                 stopRequestedByMe = state.stopRequestedByMe,

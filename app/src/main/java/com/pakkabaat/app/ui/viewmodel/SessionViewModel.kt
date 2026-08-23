@@ -92,6 +92,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
     private var pairingJob: Job? = null
     private var tickerJob: Job? = null
     private var stopTimeoutJob: Job? = null
+    private var documentObserverJob: Job? = null
     private var currentRecordingId: String? = null
 
     // ---------- Onboarding (spec 8.1) ----------
@@ -114,10 +115,55 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
 
     // ---------- Starting a session, in-person mode (spec 8.2) ----------
 
+    /**
+     * Clears everything left over from a previous session before starting the next one.
+     * Without this, a second "Record a new agreement" run reused the prior session's
+     * document/draftTranscript/stopRequestedByOtherName/etc — which caused two real bugs:
+     * the second recording's ProcessingScreen jumping straight to the FIRST recording's
+     * draft (because state.document was still non-null from before, so the "document
+     * ready" LaunchedEffect fired immediately), and RecordingScreen showing a stale
+     * "the other person wants to stop" banner left over from how the previous session
+     * ended, even though nobody pressed Stop this time.
+     */
+    private fun resetForNewSession() {
+        documentObserverJob?.cancel()
+        tickerJob?.cancel()
+        stopTimeoutJob?.cancel()
+        currentRecordingId = null
+        draftSentForSession = null
+        _uiState.update {
+            it.copy(
+                sessionId = "",
+                qrToken = null,
+                pairingConnected = false,
+                partnerName = null,
+                singlePhoneMode = false,
+                myConsent = false,
+                otherConsent = false,
+                isRecording = false,
+                elapsedSeconds = 0,
+                stopRequestedByMe = false,
+                stopRequestedByOtherName = null,
+                stopTimeoutRemaining = null,
+                stopViaTimeout = false,
+                draftTranscript = null,
+                draftIsPlaceholder = false,
+                processing = false,
+                processingStage = ProcessingStage.TRANSCRIBING,
+                processingDeviceLabel = null,
+                document = null,
+                certificate = null,
+                audioRecording = null,
+                error = null
+            )
+        }
+    }
+
     /** Party A: start advertising nearby for Party B to scan+join. No DB row is created
      *  yet — only once a real connection happens (see listenOnPairingChannel's Connected
      *  branch) so backing out here never leaves a phantom "session" behind. */
     fun startAsInitiator() {
+        resetForNewSession()
         val sessionId = UUID.randomUUID().toString()
         _uiState.update {
             it.copy(sessionId = sessionId, role = PartyRole.PARTY_A, qrToken = sessionId, pairingConnected = false)
@@ -128,6 +174,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
     /** Party B: after scanning Party A's QR code, try to join that specific session.
      *  Same as above — nothing is written to the DB until a connection actually happens. */
     fun joinAsScanner(scannedSessionToken: String) {
+        resetForNewSession()
         _uiState.update {
             it.copy(sessionId = scannedSessionToken, role = PartyRole.PARTY_B, qrToken = null, pairingConnected = false)
         }
@@ -143,6 +190,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
      *  takes the same ConsentScreen -> RecordingScreen -> ProcessingScreen path as the
      *  two-phone flow. */
     fun startSinglePhoneMode(otherPersonName: String) {
+        resetForNewSession()
         val sessionId = UUID.randomUUID().toString()
         _uiState.update {
             it.copy(
@@ -422,6 +470,16 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
 
     fun requestStop() {
         val ts = System.currentTimeMillis()
+        // Single-phone mode has no second device to ever send back a StopConfirm, so the
+        // normal mutual-consent handshake below would just wait the full 60s and then
+        // auto-stop via the timeout path every single time — pressing Stop should end the
+        // recording immediately instead, same as the back-press "End recording" action.
+        if (_uiState.value.singlePhoneMode) {
+            logConsentEvent(ConsentAction.CONSENT_STOP, _uiState.value.myUserId, ts)
+            finishRecording(viaTimeout = false)
+            return
+        }
+
         _uiState.update { it.copy(stopRequestedByMe = true) }
         pairing.send(SessionMessage.StopRequest(_uiState.value.myUserId, ts))
         logConsentEvent(ConsentAction.CONSENT_STOP, _uiState.value.myUserId, ts)
@@ -570,7 +628,8 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
     private var draftSentForSession: String? = null
 
     private fun observeDocumentReady(sessionId: String) {
-        viewModelScope.launch {
+        documentObserverJob?.cancel()
+        documentObserverJob = viewModelScope.launch {
             db.structuredDocumentDao().observeForSession(sessionId).collect { doc ->
                 if (doc != null) {
                     val cert = db.certificateDao().forDocument(doc.documentId)

@@ -1,0 +1,325 @@
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt b/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt
+index 392e425..300bf59 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt
+@@ -1,6 +1,9 @@
+ package com.pakkabaat.app.ui.navigation
+ 
+ import androidx.activity.compose.BackHandler
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.collectAsState
+@@ -118,6 +121,28 @@ fun PakkaBaatNavGraph() {
+         }
+ 
+         composable(Routes.RECORDING) {
++            // Recording previously had no BackHandler at all, so a system back press
++            // silently dropped out of the screen mid-recording with no confirmation and
++            // no way to just keep recording while stepping away. This intercepts back,
++            // asks once, and only stops if the person says so.
++            var showExitConfirm by remember { mutableStateOf(false) }
++            BackHandler(enabled = state.isRecording) { showExitConfirm = true }
++            if (showExitConfirm) {
++                AlertDialog(
++                    onDismissRequest = { showExitConfirm = false },
++                    title = { Text("End recording?") },
++                    text = { Text("Going back won't stop the recording. Do you want to end it now, or keep recording?") },
++                    confirmButton = {
++                        TextButton(onClick = {
++                            showExitConfirm = false
++                            viewModel.requestStop()
++                        }) { Text("End recording") }
++                    },
++                    dismissButton = {
++                        TextButton(onClick = { showExitConfirm = false }) { Text("Keep recording") }
++                    }
++                )
++            }
+             RecordingScreen(
+                 elapsedSeconds = state.elapsedSeconds,
+                 stopRequestedByMe = state.stopRequestedByMe,
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/screens/DocumentScreen.kt b/app/src/main/java/com/pakkabaat/app/ui/screens/DocumentScreen.kt
+index 40f6690..39b0089 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/screens/DocumentScreen.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/screens/DocumentScreen.kt
+@@ -1,9 +1,13 @@
+ package com.pakkabaat.app.ui.screens
+ 
+ import android.content.Intent
++import android.media.MediaPlayer
+ import androidx.compose.foundation.layout.*
+ import androidx.compose.foundation.rememberScrollState
+ import androidx.compose.foundation.verticalScroll
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Pause
++import androidx.compose.material.icons.filled.PlayArrow
+ import androidx.compose.material3.*
+ import androidx.compose.runtime.*
+ import androidx.compose.ui.Modifier
+@@ -16,6 +20,7 @@ import com.pakkabaat.app.data.db.CertificateEntity
+ import com.pakkabaat.app.data.db.StructuredDocumentEntity
+ import com.pakkabaat.app.pdf.PdfExporter
+ import java.io.File
++import kotlinx.coroutines.delay
+ 
+ @Composable
+ fun DocumentScreen(
+@@ -41,6 +46,14 @@ fun DocumentScreen(
+         }
+         Spacer(Modifier.height(20.dp))
+ 
++        // In-app playback of the recording that backs this draft — previously this only
++        // handed off to whatever external app the phone had for .wav files, with no way
++        // to just listen to it inside PakkaBaat itself.
++        if (audioRecording != null) {
++            AudioPlayerCard(audioRecording)
++            Spacer(Modifier.height(20.dp))
++        }
++
+         Button(
+             onClick = {
+                 val file = PdfExporter.export(context, document, certificate)
+@@ -67,14 +80,12 @@ fun DocumentScreen(
+                     Text("Transcript hash (SHA-256): ${certificate.transcriptSha256}", style = MaterialTheme.typography.bodySmall)
+                     Spacer(Modifier.height(6.dp))
+                     Text(certificate.certificateStatement, style = MaterialTheme.typography.bodySmall)
+-                    // The audio itself was already being kept on-disk (never deleted
+-                    // after processing — see AudioRecorderManager) and hashed above, but
+-                    // there was previously no way to actually get to it as evidence
+-                    // alongside the draft. This opens the real recording, same pattern
+-                    // as the PDF export button.
++                    // Share/open-in-another-app is still useful (backing it up, sending it
++                    // to someone), kept alongside the in-app player above rather than
++                    // replaced by it.
+                     if (audioRecording != null) {
+                         Spacer(Modifier.height(10.dp))
+-                        Button(
++                        OutlinedButton(
+                             onClick = {
+                                 val file = File(audioRecording.storagePath)
+                                 if (file.exists()) {
+@@ -88,10 +99,109 @@ fun DocumentScreen(
+                                 }
+                             },
+                             modifier = Modifier.fillMaxWidth()
+-                        ) { Text("Play / share original recording") }
++                        ) { Text("Share / open in another app") }
++                    }
++                }
++            }
++        }
++    }
++}
++
++/** Simple in-app play/pause + seek bar for the recording, backed by a plain MediaPlayer
++ *  (the file is a local on-device .wav, so nothing fancier than MediaPlayer is needed). */
++@Composable
++private fun AudioPlayerCard(audioRecording: AudioRecordingEntity) {
++    val context = LocalContext.current
++    var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
++    var isPlaying by remember { mutableStateOf(false) }
++    var positionMs by remember { mutableStateOf(0) }
++    var durationMs by remember { mutableStateOf(0) }
++    var loadError by remember { mutableStateOf(false) }
++
++    // Build the player once per recording file, and always release it when this screen
++    // goes away — leaking a MediaPlayer keeps the audio decoder resource held forever.
++    DisposableEffect(audioRecording.storagePath) {
++        val player = MediaPlayer()
++        runCatching {
++            player.setDataSource(audioRecording.storagePath)
++            player.setOnCompletionListener {
++                isPlaying = false
++                positionMs = 0
++            }
++            player.prepare()
++            durationMs = player.duration
++        }.onFailure { loadError = true }
++        mediaPlayer = player
++        onDispose {
++            player.release()
++            mediaPlayer = null
++        }
++    }
++
++    // Poll playback position while playing, to move the slider — MediaPlayer has no
++    // position-changed callback of its own.
++    LaunchedEffect(isPlaying) {
++        while (isPlaying) {
++            positionMs = mediaPlayer?.currentPosition ?: 0
++            delay(200)
++        }
++    }
++
++    Card(Modifier.fillMaxWidth()) {
++        Column(Modifier.padding(16.dp)) {
++            Text("Recording", fontWeight = FontWeight.Bold)
++            Spacer(Modifier.height(8.dp))
++            if (loadError) {
++                Text(
++                    "Couldn't load the recording for playback.",
++                    color = MaterialTheme.colorScheme.error,
++                    style = MaterialTheme.typography.bodySmall
++                )
++            } else {
++                Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
++                    IconButton(onClick = {
++                        val player = mediaPlayer ?: return@IconButton
++                        if (isPlaying) {
++                            player.pause()
++                            isPlaying = false
++                        } else {
++                            // If playback already reached the end, restart from the beginning
++                            // rather than doing nothing on the next tap.
++                            if (player.currentPosition >= player.duration) player.seekTo(0)
++                            player.start()
++                            isPlaying = true
++                        }
++                    }) {
++                        Icon(
++                            if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
++                            contentDescription = if (isPlaying) "Pause" else "Play"
++                        )
+                     }
++                    Spacer(Modifier.width(8.dp))
++                    Slider(
++                        value = positionMs.toFloat(),
++                        onValueChange = { newValue ->
++                            positionMs = newValue.toInt()
++                            mediaPlayer?.seekTo(newValue.toInt())
++                        },
++                        valueRange = 0f..(durationMs.coerceAtLeast(1)).toFloat(),
++                        modifier = Modifier.weight(1f)
++                    )
+                 }
++                Text(
++                    "${formatMs(positionMs)} / ${formatMs(durationMs)}",
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant
++                )
+             }
+         }
+     }
+ }
++
++private fun formatMs(ms: Int): String {
++    val totalSeconds = ms / 1000
++    val m = totalSeconds / 60
++    val s = totalSeconds % 60
++    return "%d:%02d".format(m, s)
++}
++
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt b/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt
+index 70d8385..75900e5 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt
+@@ -92,6 +92,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+     private var pairingJob: Job? = null
+     private var tickerJob: Job? = null
+     private var stopTimeoutJob: Job? = null
++    private var documentObserverJob: Job? = null
+     private var currentRecordingId: String? = null
+ 
+     // ---------- Onboarding (spec 8.1) ----------
+@@ -114,10 +115,55 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+ 
+     // ---------- Starting a session, in-person mode (spec 8.2) ----------
+ 
++    /**
++     * Clears everything left over from a previous session before starting the next one.
++     * Without this, a second "Record a new agreement" run reused the prior session's
++     * document/draftTranscript/stopRequestedByOtherName/etc — which caused two real bugs:
++     * the second recording's ProcessingScreen jumping straight to the FIRST recording's
++     * draft (because state.document was still non-null from before, so the "document
++     * ready" LaunchedEffect fired immediately), and RecordingScreen showing a stale
++     * "the other person wants to stop" banner left over from how the previous session
++     * ended, even though nobody pressed Stop this time.
++     */
++    private fun resetForNewSession() {
++        documentObserverJob?.cancel()
++        tickerJob?.cancel()
++        stopTimeoutJob?.cancel()
++        currentRecordingId = null
++        draftSentForSession = null
++        _uiState.update {
++            it.copy(
++                sessionId = "",
++                qrToken = null,
++                pairingConnected = false,
++                partnerName = null,
++                singlePhoneMode = false,
++                myConsent = false,
++                otherConsent = false,
++                isRecording = false,
++                elapsedSeconds = 0,
++                stopRequestedByMe = false,
++                stopRequestedByOtherName = null,
++                stopTimeoutRemaining = null,
++                stopViaTimeout = false,
++                draftTranscript = null,
++                draftIsPlaceholder = false,
++                processing = false,
++                processingStage = ProcessingStage.TRANSCRIBING,
++                processingDeviceLabel = null,
++                document = null,
++                certificate = null,
++                audioRecording = null,
++                error = null
++            )
++        }
++    }
++
+     /** Party A: start advertising nearby for Party B to scan+join. No DB row is created
+      *  yet — only once a real connection happens (see listenOnPairingChannel's Connected
+      *  branch) so backing out here never leaves a phantom "session" behind. */
+     fun startAsInitiator() {
++        resetForNewSession()
+         val sessionId = UUID.randomUUID().toString()
+         _uiState.update {
+             it.copy(sessionId = sessionId, role = PartyRole.PARTY_A, qrToken = sessionId, pairingConnected = false)
+@@ -128,6 +174,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+     /** Party B: after scanning Party A's QR code, try to join that specific session.
+      *  Same as above — nothing is written to the DB until a connection actually happens. */
+     fun joinAsScanner(scannedSessionToken: String) {
++        resetForNewSession()
+         _uiState.update {
+             it.copy(sessionId = scannedSessionToken, role = PartyRole.PARTY_B, qrToken = null, pairingConnected = false)
+         }
+@@ -143,6 +190,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+      *  takes the same ConsentScreen -> RecordingScreen -> ProcessingScreen path as the
+      *  two-phone flow. */
+     fun startSinglePhoneMode(otherPersonName: String) {
++        resetForNewSession()
+         val sessionId = UUID.randomUUID().toString()
+         _uiState.update {
+             it.copy(
+@@ -422,6 +470,16 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+ 
+     fun requestStop() {
+         val ts = System.currentTimeMillis()
++        // Single-phone mode has no second device to ever send back a StopConfirm, so the
++        // normal mutual-consent handshake below would just wait the full 60s and then
++        // auto-stop via the timeout path every single time — pressing Stop should end the
++        // recording immediately instead, same as the back-press "End recording" action.
++        if (_uiState.value.singlePhoneMode) {
++            logConsentEvent(ConsentAction.CONSENT_STOP, _uiState.value.myUserId, ts)
++            finishRecording(viaTimeout = false)
++            return
++        }
++
+         _uiState.update { it.copy(stopRequestedByMe = true) }
+         pairing.send(SessionMessage.StopRequest(_uiState.value.myUserId, ts))
+         logConsentEvent(ConsentAction.CONSENT_STOP, _uiState.value.myUserId, ts)
+@@ -570,7 +628,8 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+     private var draftSentForSession: String? = null
+ 
+     private fun observeDocumentReady(sessionId: String) {
+-        viewModelScope.launch {
++        documentObserverJob?.cancel()
++        documentObserverJob = viewModelScope.launch {
+             db.structuredDocumentDao().observeForSession(sessionId).collect { doc ->
+                 if (doc != null) {
+                     val cert = db.certificateDao().forDocument(doc.documentId)
