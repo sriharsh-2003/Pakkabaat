@@ -1,5 +1,6 @@
 package com.pakkabaat.app.ui.navigation
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -8,7 +9,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
@@ -48,8 +48,7 @@ fun PakkaBaatNavGraph() {
 
         composable(Routes.ONBOARDING) {
             OnboardingScreen(
-                otpService = viewModel.otpService,
-                onVerified = { _, name ->
+                onContinue = { name ->
                     viewModel.setMyIdentity(userId = UUID.randomUUID().toString(), name = name, language = chosenLanguage)
                     navController.navigate(Routes.HOME) { popUpTo(Routes.ONBOARDING) { inclusive = true } }
                 }
@@ -64,6 +63,7 @@ fun PakkaBaatNavGraph() {
                     viewModel.loadExistingSession(sessionId)
                     navController.navigate(Routes.DOCUMENT)
                 },
+                onDeleteSession = { sessionId -> viewModel.deleteSession(sessionId) },
                 onOpenSettings = { navController.navigate(Routes.SETTINGS) }
             )
         }
@@ -73,9 +73,11 @@ fun PakkaBaatNavGraph() {
         }
 
         composable(Routes.START_SESSION) {
-            // Auto-advance once both this device's consent state machine is ready.
-            LaunchedEffect(state.pairingConnected) {
-                // no-op; navigation to consent is via the explicit "Continue" tap below
+            // Backing out here (system back, or a future explicit Cancel button) must never
+            // leave advertising/discovery running or a phantom session behind.
+            BackHandler {
+                viewModel.cancelSessionSetup()
+                navController.popBackStack()
             }
             StartSessionScreen(
                 qrToken = state.qrToken,
@@ -88,6 +90,10 @@ fun PakkaBaatNavGraph() {
         }
 
         composable(Routes.CONSENT) {
+            BackHandler {
+                viewModel.cancelSessionSetup()
+                navController.popBackStack(Routes.HOME, inclusive = false)
+            }
             LaunchedEffect(state.isRecording) {
                 if (state.isRecording) navController.navigate(Routes.RECORDING) { popUpTo(Routes.CONSENT) { inclusive = true } }
             }
@@ -100,11 +106,6 @@ fun PakkaBaatNavGraph() {
         }
 
         composable(Routes.RECORDING) {
-            LaunchedEffect(state.isRecording, state.processing) {
-                if (!state.isRecording && state.processing) {
-                    navController.navigate(Routes.PROCESSING) { popUpTo(Routes.RECORDING) { inclusive = true } }
-                }
-            }
             RecordingScreen(
                 elapsedSeconds = state.elapsedSeconds,
                 stopRequestedByMe = state.stopRequestedByMe,
@@ -113,6 +114,11 @@ fun PakkaBaatNavGraph() {
                 onStop = { viewModel.requestStop() },
                 onConfirmStop = { viewModel.confirmStopRequestedByOther() }
             )
+            LaunchedEffect(state.isRecording, state.processing) {
+                if (!state.isRecording && state.processing) {
+                    navController.navigate(Routes.PROCESSING) { popUpTo(Routes.RECORDING) { inclusive = true } }
+                }
+            }
         }
 
         composable(Routes.PROCESSING) {

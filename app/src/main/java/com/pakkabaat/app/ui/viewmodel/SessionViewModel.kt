@@ -7,7 +7,6 @@ import com.pakkabaat.app.consent.stopTimeoutCountdown
 import com.pakkabaat.app.data.db.*
 import com.pakkabaat.app.data.model.*
 import com.pakkabaat.app.data.repository.ApiKeyStore
-import com.pakkabaat.app.data.repository.OtpService
 import com.pakkabaat.app.pairing.NearbyPairingManager
 import com.pakkabaat.app.pairing.PairingEvent
 import com.pakkabaat.app.pairing.SessionMessage
@@ -19,6 +18,7 @@ import com.pakkabaat.app.util.ConnectivityUtil
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import java.io.File
 import java.util.*
 
 data class SessionUiState(
@@ -54,7 +54,6 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
     private val recorder = AudioRecorderManager(application)
     private val onDeviceTranscriber: OnDeviceTranscriber = WhisperCppTranscriber(application)
     val apiKeyStore = ApiKeyStore(application)
-    val otpService = OtpService()
 
     private val _uiState = MutableStateFlow(SessionUiState())
     val uiState: StateFlow<SessionUiState> = _uiState.asStateFlow()
@@ -74,59 +73,50 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
 
     // ---------- Starting a session, in-person mode (spec 8.2) ----------
 
-    /** Party A: create a new session and start advertising nearby for Party B to scan+join. */
+    /** Party A: start advertising nearby for Party B to scan+join. No DB row is created
+     *  yet — only once a real connection happens (see listenOnPairingChannel's Connected
+     *  branch) so backing out here never leaves a phantom "session" behind. */
     fun startAsInitiator() {
         val sessionId = UUID.randomUUID().toString()
         _uiState.update {
             it.copy(sessionId = sessionId, role = PartyRole.PARTY_A, qrToken = sessionId, pairingConnected = false)
         }
-        viewModelScope.launch {
-            db.sessionDao().upsert(
-                SessionEntity(
-                    sessionId = sessionId,
-                    partyAUserId = _uiState.value.myUserId,
-                    partyBUserId = null,
-                    partyBPhone = null,
-                    partyAName = _uiState.value.myName,
-                    partyBName = null,
-                    mode = SessionMode.IN_PERSON,
-                    status = SessionStatus.PENDING_CONSENT,
-                    startedAt = null,
-                    endedAt = null,
-                    stopRequestedBy = null,
-                    stopConfirmedBy = null,
-                    myRole = PartyRole.PARTY_A
-                )
-            )
-        }
         listenOnPairingChannel(sessionId, isAdvertiser = true)
     }
 
-    /** Party B: after scanning Party A's QR code, join that specific session. */
+    /** Party B: after scanning Party A's QR code, try to join that specific session.
+     *  Same as above — nothing is written to the DB until a connection actually happens. */
     fun joinAsScanner(scannedSessionToken: String) {
         _uiState.update {
             it.copy(sessionId = scannedSessionToken, role = PartyRole.PARTY_B, qrToken = null, pairingConnected = false)
         }
-        viewModelScope.launch {
-            db.sessionDao().upsert(
-                SessionEntity(
-                    sessionId = scannedSessionToken,
-                    partyAUserId = "",              // learned once Hello arrives; fine for local bookkeeping
-                    partyBUserId = _uiState.value.myUserId,
-                    partyBPhone = null,
-                    partyAName = "",
-                    partyBName = _uiState.value.myName,
-                    mode = SessionMode.IN_PERSON,
-                    status = SessionStatus.PENDING_CONSENT,
-                    startedAt = null,
-                    endedAt = null,
-                    stopRequestedBy = null,
-                    stopConfirmedBy = null,
-                    myRole = PartyRole.PARTY_B
-                )
+        listenOnPairingChannel(scannedSessionToken, isAdvertiser = false)
+    }
+
+    /** Call this when the user backs out of pairing/consent before a session is recorded
+     *  (e.g. taps back from the QR screen, or from the consent screen before agreeing).
+     *  Tears down any in-progress advertising/discovery and, if a session row was already
+     *  created (because a connection did happen), deletes it — there's nothing worth
+     *  keeping if no recording ever started. */
+    fun cancelSessionSetup() {
+        pairingJob?.cancel()
+        pairing.teardown()
+        val sessionId = _uiState.value.sessionId
+        if (sessionId.isNotBlank()) {
+            viewModelScope.launch {
+                db.sessionDao().getById(sessionId)?.let { existing ->
+                    if (existing.status == SessionStatus.PENDING_CONSENT) {
+                        deleteSessionInternal(sessionId, existing)
+                    }
+                }
+            }
+        }
+        _uiState.update {
+            it.copy(
+                sessionId = "", qrToken = null, pairingConnected = false, partnerName = null,
+                myConsent = false, otherConsent = false
             )
         }
-        listenOnPairingChannel(scannedSessionToken, isAdvertiser = false)
     }
 
     private fun listenOnPairingChannel(sessionToken: String, isAdvertiser: Boolean) {
@@ -136,6 +126,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
                 when (event) {
                     is PairingEvent.Connected -> {
                         _uiState.update { it.copy(pairingConnected = true) }
+                        persistNewSessionOnConnect()
                         pairing.send(SessionMessage.Hello(sessionToken, _uiState.value.myName, _uiState.value.myLanguage))
                     }
                     is PairingEvent.MessageReceived -> handleIncoming(event.message)
@@ -146,9 +137,64 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Writes the session row for the first time — only once a real Nearby connection
+     *  has actually happened, so nothing is ever saved for an abandoned pairing attempt. */
+    private fun persistNewSessionOnConnect() {
+        viewModelScope.launch {
+            val s = _uiState.value
+            val entity = if (s.role == PartyRole.PARTY_A) {
+                SessionEntity(
+                    sessionId = s.sessionId,
+                    partyAUserId = s.myUserId,
+                    partyBUserId = null,
+                    partyBPhone = null,
+                    partyAName = s.myName,
+                    partyBName = s.partnerName,
+                    mode = SessionMode.IN_PERSON,
+                    status = SessionStatus.PENDING_CONSENT,
+                    startedAt = null,
+                    endedAt = null,
+                    stopRequestedBy = null,
+                    stopConfirmedBy = null,
+                    myRole = PartyRole.PARTY_A
+                )
+            } else {
+                SessionEntity(
+                    sessionId = s.sessionId,
+                    partyAUserId = "",
+                    partyBUserId = s.myUserId,
+                    partyBPhone = null,
+                    partyAName = s.partnerName ?: "",
+                    partyBName = s.myName,
+                    mode = SessionMode.IN_PERSON,
+                    status = SessionStatus.PENDING_CONSENT,
+                    startedAt = null,
+                    endedAt = null,
+                    stopRequestedBy = null,
+                    stopConfirmedBy = null,
+                    myRole = PartyRole.PARTY_B
+                )
+            }
+            db.sessionDao().upsert(entity)
+        }
+    }
+
     private fun handleIncoming(message: SessionMessage) {
         when (message) {
-            is SessionMessage.Hello -> _uiState.update { it.copy(partnerName = message.name) }
+            is SessionMessage.Hello -> {
+                _uiState.update { it.copy(partnerName = message.name) }
+                // Backfill the name into the DB row created at Connected time, in case
+                // this Hello arrives after that row was written (it usually does).
+                viewModelScope.launch {
+                    db.sessionDao().getById(_uiState.value.sessionId)?.let { existing ->
+                        val updated = if (_uiState.value.role == PartyRole.PARTY_A)
+                            existing.copy(partyBName = message.name)
+                        else
+                            existing.copy(partyAName = message.name)
+                        db.sessionDao().upsert(updated)
+                    }
+                }
+            }
             is SessionMessage.ConsentStart -> {
                 _uiState.update { it.copy(otherConsent = true) }
                 maybeBeginRecording()
@@ -330,6 +376,35 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             _uiState.update { it.copy(sessionId = sessionId, document = doc, certificate = cert) }
             if (doc == null) observeDocumentReady(sessionId)
         }
+    }
+
+    /** Deletes a session and everything under it - recording file, transcript, document,
+     *  certificate, consent log. Works regardless of what state the session got stuck in,
+     *  which covers both phantom/never-connected attempts and ones that connected but
+     *  never actually recorded anything. */
+    fun deleteSession(sessionId: String) {
+        viewModelScope.launch {
+            val session = db.sessionDao().getById(sessionId) ?: return@launch
+            deleteSessionInternal(sessionId, session)
+        }
+    }
+
+    private suspend fun deleteSessionInternal(sessionId: String, @Suppress("UNUSED_PARAMETER") session: SessionEntity) {
+        // Delete the actual audio file(s) from disk, not just the DB rows.
+        val recordings = db.audioRecordingDao().allForSession(sessionId)
+        recordings.forEach { recording ->
+            db.transcriptDao().deleteForRecording(recording.recordingId)
+            File(recording.storagePath).delete()
+        }
+        db.audioRecordingDao().deleteForSession(sessionId)
+
+        db.structuredDocumentDao().forSession(sessionId)?.let { doc ->
+            db.certificateDao().deleteForDocument(doc.documentId)
+        }
+        db.structuredDocumentDao().deleteForSession(sessionId)
+
+        db.consentEventDao().deleteForSession(sessionId)
+        db.sessionDao().deleteById(sessionId)
     }
 
     override fun onCleared() {

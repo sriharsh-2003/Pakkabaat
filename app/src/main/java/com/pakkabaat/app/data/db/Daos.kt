@@ -28,6 +28,9 @@ interface SessionDao {
 
     @Query("SELECT * FROM sessions ORDER BY startedAt DESC")
     fun observeAll(): Flow<List<SessionEntity>>
+
+    @Query("DELETE FROM sessions WHERE sessionId = :id")
+    suspend fun deleteById(id: String)
 }
 
 @Dao
@@ -37,6 +40,9 @@ interface ConsentEventDao {
 
     @Query("SELECT * FROM consent_events WHERE sessionId = :sessionId ORDER BY timestamp ASC")
     suspend fun forSession(sessionId: String): List<ConsentEventEntity>
+
+    @Query("DELETE FROM consent_events WHERE sessionId = :sessionId")
+    suspend fun deleteForSession(sessionId: String)
 }
 
 @Dao
@@ -47,11 +53,17 @@ interface AudioRecordingDao {
     @Query("SELECT * FROM audio_recordings WHERE sessionId = :sessionId LIMIT 1")
     suspend fun forSession(sessionId: String): AudioRecordingEntity?
 
+    @Query("SELECT * FROM audio_recordings WHERE sessionId = :sessionId")
+    suspend fun allForSession(sessionId: String): List<AudioRecordingEntity>
+
     @Query("SELECT * FROM audio_recordings WHERE uploadStatus = 'QUEUED' OR uploadStatus = 'LOCAL_ONLY'")
     suspend fun pendingUploads(): List<AudioRecordingEntity>
 
     @Query("UPDATE audio_recordings SET uploadStatus = :status WHERE recordingId = :id")
     suspend fun setUploadStatus(id: String, status: com.pakkabaat.app.data.model.UploadStatus)
+
+    @Query("DELETE FROM audio_recordings WHERE sessionId = :sessionId")
+    suspend fun deleteForSession(sessionId: String)
 }
 
 @Dao
@@ -61,6 +73,9 @@ interface TranscriptDao {
 
     @Query("SELECT * FROM transcripts WHERE recordingId = :recordingId")
     suspend fun forRecording(recordingId: String): List<TranscriptEntity>
+
+    @Query("DELETE FROM transcripts WHERE recordingId = :recordingId")
+    suspend fun deleteForRecording(recordingId: String)
 }
 
 @Dao
@@ -73,6 +88,9 @@ interface StructuredDocumentDao {
 
     @Query("SELECT * FROM structured_documents WHERE sessionId = :sessionId LIMIT 1")
     fun observeForSession(sessionId: String): Flow<StructuredDocumentEntity?>
+
+    @Query("DELETE FROM structured_documents WHERE sessionId = :sessionId")
+    suspend fun deleteForSession(sessionId: String)
 }
 
 @Dao
@@ -82,4 +100,7 @@ interface CertificateDao {
 
     @Query("SELECT * FROM certificates WHERE documentId = :documentId LIMIT 1")
     suspend fun forDocument(documentId: String): CertificateEntity?
+
+    @Query("DELETE FROM certificates WHERE documentId = :documentId")
+    suspend fun deleteForDocument(documentId: String)
 }

@@ -20,15 +20,9 @@
     <!-- QR scanning for pairing (spec 8.2) -->
     <uses-permission android:name="android.permission.CAMERA" />
 
-    <!-- Cloud ASR / structuring calls + OTP relay, only when connectivity exists (spec 7.1) -->
+    <!-- Cloud ASR / structuring calls, only when connectivity exists (spec 7.1) -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-
-    <!-- Queued background processing when signal returns (spec 6.4) -->
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
 
     <uses-feature android:name="android.hardware.microphone" android:required="true" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
