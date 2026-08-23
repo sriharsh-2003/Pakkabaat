@@ -143,12 +143,15 @@ fun PakkaBaatNavGraph() {
                 draftTranscript = state.draftTranscript,
                 isOnline = state.isOnline,
                 stopViaTimeout = state.stopViaTimeout,
+                stage = state.processingStage,
+                processingDeviceLabel = state.processingDeviceLabel,
+                isHost = state.singlePhoneMode || state.role == com.pakkabaat.app.data.model.PartyRole.PARTY_A,
                 errorMessage = state.error
             )
         }
 
         composable(Routes.DOCUMENT) {
-            DocumentScreen(document = state.document, certificate = state.certificate)
+            DocumentScreen(document = state.document, certificate = state.certificate, audioRecording = state.audioRecording)
         }
     }
 }

@@ -20,3 +20,7 @@ enum class AgreementType { LOAN, RENT, WAGE, SALE, OTHER, UNDETERMINED }
 
 /** Which of the two people this device belongs to, for a given session. */
 enum class PartyRole { PARTY_A, PARTY_B }
+
+/** Drives the progress bar on ProcessingScreen so the user sees what's actually
+ *  happening instead of one generic spinner for the whole draft wait. */
+enum class ProcessingStage { TRANSCRIBING, STRUCTURING, WAITING_FOR_HOST, DONE }

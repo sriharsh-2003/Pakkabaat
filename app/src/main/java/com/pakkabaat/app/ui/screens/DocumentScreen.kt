@@ -11,14 +11,17 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import com.pakkabaat.app.data.db.AudioRecordingEntity
 import com.pakkabaat.app.data.db.CertificateEntity
 import com.pakkabaat.app.data.db.StructuredDocumentEntity
 import com.pakkabaat.app.pdf.PdfExporter
+import java.io.File
 
 @Composable
 fun DocumentScreen(
     document: StructuredDocumentEntity?,
-    certificate: CertificateEntity?
+    certificate: CertificateEntity?,
+    audioRecording: AudioRecordingEntity? = null
 ) {
     val context = LocalContext.current
     var proofExpanded by remember { mutableStateOf(false) }
@@ -64,6 +67,29 @@ fun DocumentScreen(
                     Text("Transcript hash (SHA-256): ${certificate.transcriptSha256}", style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(6.dp))
                     Text(certificate.certificateStatement, style = MaterialTheme.typography.bodySmall)
+                    // The audio itself was already being kept on-disk (never deleted
+                    // after processing — see AudioRecorderManager) and hashed above, but
+                    // there was previously no way to actually get to it as evidence
+                    // alongside the draft. This opens the real recording, same pattern
+                    // as the PDF export button.
+                    if (audioRecording != null) {
+                        Spacer(Modifier.height(10.dp))
+                        Button(
+                            onClick = {
+                                val file = File(audioRecording.storagePath)
+                                if (file.exists()) {
+                                    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+                                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                                        setDataAndType(uri, "audio/wav")
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    }
+                                    runCatching { context.startActivity(intent) }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("Play / share original recording") }
+                    }
                 }
             }
         }

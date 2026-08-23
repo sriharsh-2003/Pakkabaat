@@ -40,7 +40,7 @@ Java_com_pakkabaat_app_recording_WhisperCppTranscriber_nativeInit(
 JNIEXPORT jstring JNICALL
 Java_com_pakkabaat_app_recording_WhisperCppTranscriber_nativeTranscribe(
         JNIEnv *env, jobject /* this */, jlong ctxPtr, jfloatArray samples,
-        jstring language, jboolean enableDiarization) {
+        jstring language, jboolean enableDiarization, jint nThreads) {
 
     auto *ctx = reinterpret_cast<struct whisper_context *>(ctxPtr);
     if (ctx == nullptr) {
@@ -60,7 +60,11 @@ Java_com_pakkabaat_app_recording_WhisperCppTranscriber_nativeTranscribe(
     params.print_timestamps = false;
     params.translate        = false; // keep the original language, never auto-translate to English
     params.language         = hasLang ? lang : nullptr; // nullptr = auto-detect
-    params.n_threads        = 4;
+    // Was hardcoded to 4 regardless of device — on a 6/8-core mid-range phone that
+    // left cores idle and was a big chunk of "why is this so slow". Kotlin now passes
+    // Runtime.getRuntime().availableProcessors() (minus a little headroom), so this
+    // scales to the actual device instead of leaving performance on the table.
+    params.n_threads        = nThreads > 0 ? nThreads : 4;
     params.tdrz_enable      = enableDiarization;
 
     int result = whisper_full(ctx, params, pcm.data(), n_samples);

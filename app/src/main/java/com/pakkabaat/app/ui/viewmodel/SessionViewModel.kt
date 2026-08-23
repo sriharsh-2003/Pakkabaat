@@ -49,8 +49,13 @@ data class SessionUiState(
     val draftIsPlaceholder: Boolean = false,
     val isOnline: Boolean = true,
     val processing: Boolean = false,
+    val processingStage: ProcessingStage = ProcessingStage.TRANSCRIBING,
+    // Which phone is actually doing the Gemini/whisper work, for ProcessingScreen —
+    // only the host ever processes; the other phone just waits for DraftReady.
+    val processingDeviceLabel: String? = null,
     val document: StructuredDocumentEntity? = null,
     val certificate: CertificateEntity? = null,
+    val audioRecording: AudioRecordingEntity? = null,
     val error: String? = null
 )
 
@@ -456,17 +461,20 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             val sessionId = _uiState.value.sessionId
             val language = _uiState.value.myLanguage
 
-            db.audioRecordingDao().upsert(
-                AudioRecordingEntity(
-                    recordingId = recordingId,
-                    sessionId = sessionId,
-                    storagePath = result.file.absolutePath,
-                    durationSeconds = result.durationSeconds,
-                    sha256Hash = result.sha256,
-                    languageDetected = language,
-                    uploadStatus = UploadStatus.LOCAL_ONLY
-                )
+            val recordingEntity = AudioRecordingEntity(
+                recordingId = recordingId,
+                sessionId = sessionId,
+                storagePath = result.file.absolutePath,
+                durationSeconds = result.durationSeconds,
+                sha256Hash = result.sha256,
+                languageDetected = language,
+                uploadStatus = UploadStatus.LOCAL_ONLY
             )
+            db.audioRecordingDao().upsert(recordingEntity)
+            // Kept on disk (not deleted) as the proof-of-recording backing this draft —
+            // see DocumentScreen's "Proof details", which now offers it for playback/share
+            // alongside the hash, not just the hash on its own.
+            _uiState.update { it.copy(audioRecording = recordingEntity) }
             db.sessionDao().getById(sessionId)?.let {
                 db.sessionDao().upsert(
                     it.copy(
@@ -479,7 +487,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
 
             // Speech-to-text, fully on-device via whisper.cpp — no signal needed (spec 6.4/8.6).
             // This is now the ONE and only transcript; there's no separate cloud ASR pass anymore.
-            _uiState.update { it.copy(processing = true) }
+            _uiState.update { it.copy(processing = true, processingStage = ProcessingStage.TRANSCRIBING) }
             val transcriptResult = onDeviceTranscriber.transcribe(result.file, language)
             val transcriptId = UUID.randomUUID().toString()
             db.transcriptDao().upsert(
@@ -500,6 +508,17 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             val isHost = s.singlePhoneMode || s.role == PartyRole.PARTY_A
             val partyAName = if (s.role == PartyRole.PARTY_A) s.myName else (s.partnerName ?: "Party A")
             val partyBName = if (s.role == PartyRole.PARTY_B) s.myName else (s.partnerName ?: "Party B")
+
+            // Only ever describes THIS device — the host is always Party A's phone, so
+            // label it by who's holding it (their name), which is what actually
+            // answers "which phone is doing this" for the person staring at the screen.
+            val hostLabel = if (s.singlePhoneMode) "${s.myName}'s phone (this device)" else "${partyAName}'s phone"
+            _uiState.update {
+                it.copy(
+                    processingDeviceLabel = hostLabel,
+                    processingStage = if (isHost) ProcessingStage.STRUCTURING else ProcessingStage.WAITING_FOR_HOST
+                )
+            }
 
             if (isHost) {
                 // Only the host calls Gemini. Previously BOTH phones independently
@@ -555,7 +574,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             db.structuredDocumentDao().observeForSession(sessionId).collect { doc ->
                 if (doc != null) {
                     val cert = db.certificateDao().forDocument(doc.documentId)
-                    _uiState.update { it.copy(document = doc, certificate = cert, processing = false, error = null) }
+                    _uiState.update { it.copy(document = doc, certificate = cert, processing = false, processingStage = ProcessingStage.DONE, error = null) }
 
                     // Host, paired (not single-phone): hand the finished draft to the
                     // partner device so it never has to call Gemini itself. Guarded so a
@@ -587,7 +606,8 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             val doc = db.structuredDocumentDao().forSession(sessionId)
             val cert = doc?.let { db.certificateDao().forDocument(it.documentId) }
-            _uiState.update { it.copy(sessionId = sessionId, document = doc, certificate = cert) }
+            val recording = db.audioRecordingDao().forSession(sessionId)
+            _uiState.update { it.copy(sessionId = sessionId, document = doc, certificate = cert, audioRecording = recording) }
             if (doc == null) observeDocumentReady(sessionId)
         }
     }

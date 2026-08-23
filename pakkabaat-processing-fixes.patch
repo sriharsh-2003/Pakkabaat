@@ -1,0 +1,361 @@
+diff --git a/app/src/main/cpp/whisper_jni.cpp b/app/src/main/cpp/whisper_jni.cpp
+index b20d3ad..a2643b0 100644
+--- a/app/src/main/cpp/whisper_jni.cpp
++++ b/app/src/main/cpp/whisper_jni.cpp
+@@ -40,7 +40,7 @@ Java_com_pakkabaat_app_recording_WhisperCppTranscriber_nativeInit(
+ JNIEXPORT jstring JNICALL
+ Java_com_pakkabaat_app_recording_WhisperCppTranscriber_nativeTranscribe(
+         JNIEnv *env, jobject /* this */, jlong ctxPtr, jfloatArray samples,
+-        jstring language, jboolean enableDiarization) {
++        jstring language, jboolean enableDiarization, jint nThreads) {
+ 
+     auto *ctx = reinterpret_cast<struct whisper_context *>(ctxPtr);
+     if (ctx == nullptr) {
+@@ -60,7 +60,11 @@ Java_com_pakkabaat_app_recording_WhisperCppTranscriber_nativeTranscribe(
+     params.print_timestamps = false;
+     params.translate        = false; // keep the original language, never auto-translate to English
+     params.language         = hasLang ? lang : nullptr; // nullptr = auto-detect
+-    params.n_threads        = 4;
++    // Was hardcoded to 4 regardless of device — on a 6/8-core mid-range phone that
++    // left cores idle and was a big chunk of "why is this so slow". Kotlin now passes
++    // Runtime.getRuntime().availableProcessors() (minus a little headroom), so this
++    // scales to the actual device instead of leaving performance on the table.
++    params.n_threads        = nThreads > 0 ? nThreads : 4;
+     params.tdrz_enable      = enableDiarization;
+ 
+     int result = whisper_full(ctx, params, pcm.data(), n_samples);
+diff --git a/app/src/main/java/com/pakkabaat/app/data/model/Enums.kt b/app/src/main/java/com/pakkabaat/app/data/model/Enums.kt
+index b553909..7c9d6d0 100644
+--- a/app/src/main/java/com/pakkabaat/app/data/model/Enums.kt
++++ b/app/src/main/java/com/pakkabaat/app/data/model/Enums.kt
+@@ -20,3 +20,7 @@ enum class AgreementType { LOAN, RENT, WAGE, SALE, OTHER, UNDETERMINED }
+ 
+ /** Which of the two people this device belongs to, for a given session. */
+ enum class PartyRole { PARTY_A, PARTY_B }
++
++/** Drives the progress bar on ProcessingScreen so the user sees what's actually
++ *  happening instead of one generic spinner for the whole draft wait. */
++enum class ProcessingStage { TRANSCRIBING, STRUCTURING, WAITING_FOR_HOST, DONE }
+diff --git a/app/src/main/java/com/pakkabaat/app/recording/WhisperCppTranscriber.kt b/app/src/main/java/com/pakkabaat/app/recording/WhisperCppTranscriber.kt
+index bb8aca9..99c6f35 100644
+--- a/app/src/main/java/com/pakkabaat/app/recording/WhisperCppTranscriber.kt
++++ b/app/src/main/java/com/pakkabaat/app/recording/WhisperCppTranscriber.kt
+@@ -36,7 +36,7 @@ class WhisperCppTranscriber(private val context: Context) : OnDeviceTranscriber
+     }
+ 
+     private external fun nativeInit(modelPath: String): Long
+-    private external fun nativeTranscribe(ctxPtr: Long, samples: FloatArray, language: String, enableDiarization: Boolean): String
++    private external fun nativeTranscribe(ctxPtr: Long, samples: FloatArray, language: String, enableDiarization: Boolean, nThreads: Int): String
+     private external fun nativeFree(ctxPtr: Long)
+ 
+     override suspend fun transcribe(audioFile: File, languageHint: String): DraftTranscriptResult = withContext(Dispatchers.Default) {
+@@ -51,7 +51,11 @@ class WhisperCppTranscriber(private val context: Context) : OnDeviceTranscriber
+         }
+         try {
+             val samples = WavPcmReader.readAsFloatPcm(audioFile)
+-            val text = nativeTranscribe(ctxPtr, samples, languageHint, ENABLE_DIARIZATION)
++            // Leave one core free for the UI/audio threads instead of pegging every
++            // core — on an 8-core phone that's 7 threads instead of the old fixed 4,
++            // which is the single biggest lever on transcription wall-clock time.
++            val threads = (Runtime.getRuntime().availableProcessors() - 1).coerceIn(2, 8)
++            val text = nativeTranscribe(ctxPtr, samples, languageHint, ENABLE_DIARIZATION, threads)
+             DraftTranscriptResult(text = text.ifBlank { "(No speech detected)" }, isPlaceholder = false)
+         } finally {
+             nativeFree(ctxPtr)
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt b/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt
+index fccf8e0..392e425 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/navigation/NavGraph.kt
+@@ -143,12 +143,15 @@ fun PakkaBaatNavGraph() {
+                 draftTranscript = state.draftTranscript,
+                 isOnline = state.isOnline,
+                 stopViaTimeout = state.stopViaTimeout,
++                stage = state.processingStage,
++                processingDeviceLabel = state.processingDeviceLabel,
++                isHost = state.singlePhoneMode || state.role == com.pakkabaat.app.data.model.PartyRole.PARTY_A,
+                 errorMessage = state.error
+             )
+         }
+ 
+         composable(Routes.DOCUMENT) {
+-            DocumentScreen(document = state.document, certificate = state.certificate)
++            DocumentScreen(document = state.document, certificate = state.certificate, audioRecording = state.audioRecording)
+         }
+     }
+ }
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/screens/DocumentScreen.kt b/app/src/main/java/com/pakkabaat/app/ui/screens/DocumentScreen.kt
+index 13d1327..40f6690 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/screens/DocumentScreen.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/screens/DocumentScreen.kt
+@@ -11,14 +11,17 @@ import androidx.compose.ui.platform.LocalContext
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.unit.dp
+ import androidx.core.content.FileProvider
++import com.pakkabaat.app.data.db.AudioRecordingEntity
+ import com.pakkabaat.app.data.db.CertificateEntity
+ import com.pakkabaat.app.data.db.StructuredDocumentEntity
+ import com.pakkabaat.app.pdf.PdfExporter
++import java.io.File
+ 
+ @Composable
+ fun DocumentScreen(
+     document: StructuredDocumentEntity?,
+-    certificate: CertificateEntity?
++    certificate: CertificateEntity?,
++    audioRecording: AudioRecordingEntity? = null
+ ) {
+     val context = LocalContext.current
+     var proofExpanded by remember { mutableStateOf(false) }
+@@ -64,6 +67,29 @@ fun DocumentScreen(
+                     Text("Transcript hash (SHA-256): ${certificate.transcriptSha256}", style = MaterialTheme.typography.bodySmall)
+                     Spacer(Modifier.height(6.dp))
+                     Text(certificate.certificateStatement, style = MaterialTheme.typography.bodySmall)
++                    // The audio itself was already being kept on-disk (never deleted
++                    // after processing — see AudioRecorderManager) and hashed above, but
++                    // there was previously no way to actually get to it as evidence
++                    // alongside the draft. This opens the real recording, same pattern
++                    // as the PDF export button.
++                    if (audioRecording != null) {
++                        Spacer(Modifier.height(10.dp))
++                        Button(
++                            onClick = {
++                                val file = File(audioRecording.storagePath)
++                                if (file.exists()) {
++                                    val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
++                                    val intent = Intent(Intent.ACTION_VIEW).apply {
++                                        setDataAndType(uri, "audio/wav")
++                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
++                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++                                    }
++                                    runCatching { context.startActivity(intent) }
++                                }
++                            },
++                            modifier = Modifier.fillMaxWidth()
++                        ) { Text("Play / share original recording") }
++                    }
+                 }
+             }
+         }
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/screens/ProcessingScreen.kt b/app/src/main/java/com/pakkabaat/app/ui/screens/ProcessingScreen.kt
+index 2420799..897cb95 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/screens/ProcessingScreen.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/screens/ProcessingScreen.kt
+@@ -7,6 +7,7 @@ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.unit.dp
++import com.pakkabaat.app.data.model.ProcessingStage
+ import com.pakkabaat.app.util.KeepScreenOn
+ 
+ @Composable
+@@ -14,6 +15,9 @@ fun ProcessingScreen(
+     draftTranscript: String?,
+     isOnline: Boolean,
+     stopViaTimeout: Boolean,
++    stage: ProcessingStage = ProcessingStage.TRANSCRIBING,
++    processingDeviceLabel: String? = null,
++    isHost: Boolean = true,
+     errorMessage: String? = null
+ ) {
+     // On-device transcription + the Gemini structuring call can both take a while —
+@@ -34,6 +38,37 @@ fun ProcessingScreen(
+                 modifier = Modifier.padding(16.dp)
+             )
+         }
++        Spacer(Modifier.height(16.dp))
++
++        if (errorMessage == null) {
++            // "Which phone is doing this" — only the host phone ever transcribes/calls
++            // Gemini; the other phone is just waiting for DraftReady over the Nearby
++            // link. Making that explicit avoids the client phone's screen looking like
++            // it's silently hung when it's actually meant to sit idle.
++            Text(
++                if (isHost) "Processing on: $processingDeviceLabel"
++                else "Waiting for ${processingDeviceLabel ?: "the host"} to finish — no processing needed on this phone",
++                style = MaterialTheme.typography.bodySmall
++            )
++            Spacer(Modifier.height(12.dp))
++
++            val stageLabel = when (stage) {
++                ProcessingStage.TRANSCRIBING -> "Step 1 of 2 — transcribing audio on-device"
++                ProcessingStage.STRUCTURING -> "Step 2 of 2 — preparing the official record with Gemini"
++                ProcessingStage.WAITING_FOR_HOST -> "Waiting for the host's draft"
++                ProcessingStage.DONE -> "Done"
++            }
++            val progress = when (stage) {
++                ProcessingStage.TRANSCRIBING -> 0.35f
++                ProcessingStage.STRUCTURING -> 0.75f
++                ProcessingStage.WAITING_FOR_HOST -> 0.5f
++                ProcessingStage.DONE -> 1f
++            }
++            Text(stageLabel, style = MaterialTheme.typography.labelMedium)
++            Spacer(Modifier.height(6.dp))
++            LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
++        }
++
+         Spacer(Modifier.height(24.dp))
+         when {
+             // Previously a failure here (bad/missing API key, Gemini error, parsing
+@@ -55,9 +90,9 @@ fun ProcessingScreen(
+                 )
+             }
+             isOnline -> {
+-                CircularProgressIndicator()
+-                Spacer(Modifier.height(8.dp))
+-                Text("Preparing your official record…")
++                // Stage progress bar above already covers "what's happening" —
++                // just a small spinner here so it doesn't look stalled.
++                CircularProgressIndicator(modifier = Modifier.size(20.dp))
+             }
+             else -> {
+                 Text("Saved — this will finish processing when you're back online.")
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt b/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt
+index b5258d0..70d8385 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/viewmodel/SessionViewModel.kt
+@@ -49,8 +49,13 @@ data class SessionUiState(
+     val draftIsPlaceholder: Boolean = false,
+     val isOnline: Boolean = true,
+     val processing: Boolean = false,
++    val processingStage: ProcessingStage = ProcessingStage.TRANSCRIBING,
++    // Which phone is actually doing the Gemini/whisper work, for ProcessingScreen —
++    // only the host ever processes; the other phone just waits for DraftReady.
++    val processingDeviceLabel: String? = null,
+     val document: StructuredDocumentEntity? = null,
+     val certificate: CertificateEntity? = null,
++    val audioRecording: AudioRecordingEntity? = null,
+     val error: String? = null
+ )
+ 
+@@ -456,17 +461,20 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+             val sessionId = _uiState.value.sessionId
+             val language = _uiState.value.myLanguage
+ 
+-            db.audioRecordingDao().upsert(
+-                AudioRecordingEntity(
+-                    recordingId = recordingId,
+-                    sessionId = sessionId,
+-                    storagePath = result.file.absolutePath,
+-                    durationSeconds = result.durationSeconds,
+-                    sha256Hash = result.sha256,
+-                    languageDetected = language,
+-                    uploadStatus = UploadStatus.LOCAL_ONLY
+-                )
++            val recordingEntity = AudioRecordingEntity(
++                recordingId = recordingId,
++                sessionId = sessionId,
++                storagePath = result.file.absolutePath,
++                durationSeconds = result.durationSeconds,
++                sha256Hash = result.sha256,
++                languageDetected = language,
++                uploadStatus = UploadStatus.LOCAL_ONLY
+             )
++            db.audioRecordingDao().upsert(recordingEntity)
++            // Kept on disk (not deleted) as the proof-of-recording backing this draft —
++            // see DocumentScreen's "Proof details", which now offers it for playback/share
++            // alongside the hash, not just the hash on its own.
++            _uiState.update { it.copy(audioRecording = recordingEntity) }
+             db.sessionDao().getById(sessionId)?.let {
+                 db.sessionDao().upsert(
+                     it.copy(
+@@ -479,7 +487,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+ 
+             // Speech-to-text, fully on-device via whisper.cpp — no signal needed (spec 6.4/8.6).
+             // This is now the ONE and only transcript; there's no separate cloud ASR pass anymore.
+-            _uiState.update { it.copy(processing = true) }
++            _uiState.update { it.copy(processing = true, processingStage = ProcessingStage.TRANSCRIBING) }
+             val transcriptResult = onDeviceTranscriber.transcribe(result.file, language)
+             val transcriptId = UUID.randomUUID().toString()
+             db.transcriptDao().upsert(
+@@ -501,6 +509,17 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+             val partyAName = if (s.role == PartyRole.PARTY_A) s.myName else (s.partnerName ?: "Party A")
+             val partyBName = if (s.role == PartyRole.PARTY_B) s.myName else (s.partnerName ?: "Party B")
+ 
++            // Only ever describes THIS device — the host is always Party A's phone, so
++            // label it by who's holding it (their name), which is what actually
++            // answers "which phone is doing this" for the person staring at the screen.
++            val hostLabel = if (s.singlePhoneMode) "${s.myName}'s phone (this device)" else "${partyAName}'s phone"
++            _uiState.update {
++                it.copy(
++                    processingDeviceLabel = hostLabel,
++                    processingStage = if (isHost) ProcessingStage.STRUCTURING else ProcessingStage.WAITING_FOR_HOST
++                )
++            }
++
+             if (isHost) {
+                 // Only the host calls Gemini. Previously BOTH phones independently
+                 // structured the same transcript, doubling Gemini API usage/credits for
+@@ -555,7 +574,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+             db.structuredDocumentDao().observeForSession(sessionId).collect { doc ->
+                 if (doc != null) {
+                     val cert = db.certificateDao().forDocument(doc.documentId)
+-                    _uiState.update { it.copy(document = doc, certificate = cert, processing = false, error = null) }
++                    _uiState.update { it.copy(document = doc, certificate = cert, processing = false, processingStage = ProcessingStage.DONE, error = null) }
+ 
+                     // Host, paired (not single-phone): hand the finished draft to the
+                     // partner device so it never has to call Gemini itself. Guarded so a
+@@ -587,7 +606,8 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
+         viewModelScope.launch {
+             val doc = db.structuredDocumentDao().forSession(sessionId)
+             val cert = doc?.let { db.certificateDao().forDocument(it.documentId) }
+-            _uiState.update { it.copy(sessionId = sessionId, document = doc, certificate = cert) }
++            val recording = db.audioRecordingDao().forSession(sessionId)
++            _uiState.update { it.copy(sessionId = sessionId, document = doc, certificate = cert, audioRecording = recording) }
+             if (doc == null) observeDocumentReady(sessionId)
+         }
+     }
+diff --git a/app/src/main/java/com/pakkabaat/app/util/KeepScreenOn.kt b/app/src/main/java/com/pakkabaat/app/util/KeepScreenOn.kt
+index 07b287e..29dd9ac 100644
+--- a/app/src/main/java/com/pakkabaat/app/util/KeepScreenOn.kt
++++ b/app/src/main/java/com/pakkabaat/app/util/KeepScreenOn.kt
+@@ -1,11 +1,27 @@
+ package com.pakkabaat.app.util
+ 
+ import android.app.Activity
++import android.content.Context
++import android.content.ContextWrapper
+ import android.view.WindowManager
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.ui.platform.LocalContext
+ 
++/** LocalContext.current in Compose is often a ContextWrapper (e.g. the Activity's
++ *  Compose-specific wrapper), not the Activity itself — a direct `as? Activity` cast
++ *  on it silently returns null and the FLAG_KEEP_SCREEN_ON call never happens, which
++ *  is exactly the "I asked for this and the screen still sleeps" bug. Unwrap until we
++ *  hit the real Activity. */
++private fun Context.findActivity(): Activity? {
++    var ctx = this
++    while (ctx is ContextWrapper) {
++        if (ctx is Activity) return ctx
++        ctx = ctx.baseContext
++    }
++    return ctx as? Activity
++}
++
+ /**
+  * Keeps the device screen on for as long as the composable calling this stays in
+  * composition (recording, processing, and QR pairing all involve the user staring at
+@@ -18,7 +34,7 @@ import androidx.compose.ui.platform.LocalContext
+ fun KeepScreenOn() {
+     val context = LocalContext.current
+     DisposableEffect(Unit) {
+-        val activity = context as? Activity
++        val activity = context.findActivity()
+         activity?.window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+         onDispose {
+             activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+diff --git a/app/src/main/res/xml/file_paths.xml b/app/src/main/res/xml/file_paths.xml
+index e19d00e..682826e 100644
+--- a/app/src/main/res/xml/file_paths.xml
++++ b/app/src/main/res/xml/file_paths.xml
+@@ -1,5 +1,9 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <paths xmlns:android="http://schemas.android.com/apk/res/android">
+     <files-path name="documents" path="documents/" />
++    <!-- Was missing — the new "Play / share original recording" button opens files
++         from here via FileProvider, which would otherwise throw an IllegalArgumentException
++         ("failed to find configured root") since only documents/ was exposed before. -->
++    <files-path name="recordings" path="recordings/" />
+     <cache-path name="cache" path="." />
+ </paths>

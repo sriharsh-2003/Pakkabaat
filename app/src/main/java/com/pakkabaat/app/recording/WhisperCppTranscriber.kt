@@ -36,7 +36,7 @@ class WhisperCppTranscriber(private val context: Context) : OnDeviceTranscriber 
     }
 
     private external fun nativeInit(modelPath: String): Long
-    private external fun nativeTranscribe(ctxPtr: Long, samples: FloatArray, language: String, enableDiarization: Boolean): String
+    private external fun nativeTranscribe(ctxPtr: Long, samples: FloatArray, language: String, enableDiarization: Boolean, nThreads: Int): String
     private external fun nativeFree(ctxPtr: Long)
 
     override suspend fun transcribe(audioFile: File, languageHint: String): DraftTranscriptResult = withContext(Dispatchers.Default) {
@@ -51,7 +51,11 @@ class WhisperCppTranscriber(private val context: Context) : OnDeviceTranscriber 
         }
         try {
             val samples = WavPcmReader.readAsFloatPcm(audioFile)
-            val text = nativeTranscribe(ctxPtr, samples, languageHint, ENABLE_DIARIZATION)
+            // Leave one core free for the UI/audio threads instead of pegging every
+            // core — on an 8-core phone that's 7 threads instead of the old fixed 4,
+            // which is the single biggest lever on transcription wall-clock time.
+            val threads = (Runtime.getRuntime().availableProcessors() - 1).coerceIn(2, 8)
+            val text = nativeTranscribe(ctxPtr, samples, languageHint, ENABLE_DIARIZATION, threads)
             DraftTranscriptResult(text = text.ifBlank { "(No speech detected)" }, isPlaceholder = false)
         } finally {
             nativeFree(ctxPtr)
