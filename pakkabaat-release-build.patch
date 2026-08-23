@@ -1,0 +1,54 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index e2f1cdd..9666a6b 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -47,8 +47,17 @@ jobs:
+       - name: Build debug APK
+         run: gradle assembleDebug --stacktrace
+ 
+-      - name: Upload APK as a downloadable artifact
++      - name: Build release APK
++        run: gradle assembleRelease --stacktrace
++
++      - name: Upload debug APK as a downloadable artifact
+         uses: actions/upload-artifact@v4
+         with:
+           name: PakkaBaat-local-asr-debug-apk
+           path: app/build/outputs/apk/debug/app-debug.apk
++
++      - name: Upload release APK as a downloadable artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: PakkaBaat-local-asr-release-apk
++          path: app/build/outputs/apk/release/app-release.apk
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 8035cf8..258913f 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -61,6 +61,12 @@ android {
+     buildTypes {
+         release {
+             isMinifyEnabled = false
++            // Previously had no signingConfig at all, which means `assembleRelease` would
++            // produce app-release-unsigned.apk — not installable on a device as-is. Signing
++            // with the debug key here is the quick path: a real, installable release build
++            // for testing, not a production Play Store signing key (see note below if you
++            // need that instead).
++            signingConfig = signingConfigs.getByName("debug")
+             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+         }
+         debug {
+diff --git a/app/proguard-rules.pro b/app/proguard-rules.pro
+index 674925e..13901fc 100644
+--- a/app/proguard-rules.pro
++++ b/app/proguard-rules.pro
+@@ -1,3 +1,9 @@
+ # Add project specific ProGuard rules here.
+ -keep class com.pakkabaat.app.data.model.** { *; }
+ -keep class com.pakkabaat.app.network.** { *; }
++# SessionMessage and its sealed subclasses (Hello, StopRequest, DraftReady, etc.) are
++# serialized/deserialized by Gson via reflection over their own field names. Not covered
++# by the two rules above (different package) — if minification is ever turned on without
++# this, Gson's field-name matching breaks silently once field names get obfuscated, which
++# would reintroduce exactly the kind of broken pairing/stop-request bugs already fixed.
++-keep class com.pakkabaat.app.pairing.** { *; }

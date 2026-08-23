@@ -61,6 +61,12 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            // Previously had no signingConfig at all, which means `assembleRelease` would
+            // produce app-release-unsigned.apk — not installable on a device as-is. Signing
+            // with the debug key here is the quick path: a real, installable release build
+            // for testing, not a production Play Store signing key (see note below if you
+            // need that instead).
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
         debug {
