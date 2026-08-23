@@ -6,11 +6,13 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.path
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -21,6 +23,35 @@ import com.pakkabaat.app.data.db.StructuredDocumentEntity
 import com.pakkabaat.app.pdf.PdfExporter
 import java.io.File
 import kotlinx.coroutines.delay
+
+// PlayArrow ships in the small "core" icon set bundled with material3, but Pause does
+// not — it's only in material-icons-extended, a separate and fairly large dependency
+// this project doesn't otherwise need. Rather than add that whole library for one icon,
+// build the two-bar pause glyph by hand as a tiny custom vector.
+private val PauseIcon: ImageVector by lazy {
+    ImageVector.Builder(
+        name = "Pause",
+        defaultWidth = 24.dp,
+        defaultHeight = 24.dp,
+        viewportWidth = 24f,
+        viewportHeight = 24f
+    ).apply {
+        path(fill = androidx.compose.ui.graphics.SolidColor(Color.Black)) {
+            moveTo(6f, 5f)
+            horizontalLineTo(10f)
+            verticalLineTo(19f)
+            horizontalLineTo(6f)
+            close()
+        }
+        path(fill = androidx.compose.ui.graphics.SolidColor(Color.Black)) {
+            moveTo(14f, 5f)
+            horizontalLineTo(18f)
+            verticalLineTo(19f)
+            horizontalLineTo(14f)
+            close()
+        }
+    }.build()
+}
 
 @Composable
 fun DocumentScreen(
@@ -173,7 +204,7 @@ private fun AudioPlayerCard(audioRecording: AudioRecordingEntity) {
                         }
                     }) {
                         Icon(
-                            if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            if (isPlaying) PauseIcon else Icons.Default.PlayArrow,
                             contentDescription = if (isPlaying) "Pause" else "Play"
                         )
                     }
