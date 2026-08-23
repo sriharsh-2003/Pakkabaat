@@ -17,7 +17,12 @@ data class StructuringResult(
 
 class GeminiStructuringService(
     private val api: GeminiApiService = NetworkModule.geminiApi,
-    private val model: String = "gemini-2.5-flash", // free-tier model; swap to flash-lite for even higher free rate limits
+    // gemini-2.5-flash now 404s for new API keys/projects — Google is routing it to
+    // "no longer available" ahead of its Oct 16 2026 shutdown, which is exactly the
+    // 404 spike you saw. gemini-flash-latest is an alias Google keeps pointed at
+    // whatever the current stable Flash model is, so this survives the *next*
+    // retirement too instead of needing another hardcoded-string hunt.
+    private val model: String = "gemini-flash-latest",
     /** BYOK: pass the tester's own key from ApiKeyStore. Falls back to BuildConfig's key, if set, for convenience during solo dev testing. */
     private val apiKey: String? = null
 ) {
@@ -87,7 +92,7 @@ class GeminiStructuringService(
             dateOfConversationIso = json.optString("dateOfConversationIso").takeIf { it.isNotBlank() },
             terms = terms,
             unclearItems = unclear,
-            modelUsed = "gemini-2.5-flash"
+            modelUsed = model
         )
     }
 }
