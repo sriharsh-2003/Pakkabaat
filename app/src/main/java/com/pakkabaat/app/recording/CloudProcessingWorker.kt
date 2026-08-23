@@ -35,6 +35,12 @@ class CloudProcessingWorker(
         const val KEY_LANGUAGE_NAME = "languageName"
         const val KEY_PARTY_A_NAME = "partyAName"
         const val KEY_PARTY_B_NAME = "partyBName"
+        const val KEY_ERROR = "error"
+
+        /** Unique work name for a given session — used by the ViewModel to observe this
+         *  worker's WorkInfo (state + output data) so a failure can be surfaced in the UI
+         *  instead of leaving ProcessingScreen spinning forever. */
+        fun workName(sessionId: String) = "process_session_$sessionId"
 
         fun enqueue(
             context: Context,
@@ -71,7 +77,7 @@ class CloudProcessingWorker(
                 .build()
 
             WorkManager.getInstance(context)
-                .enqueueUniqueWork("process_session_$sessionId", ExistingWorkPolicy.KEEP, request)
+                .enqueueUniqueWork(workName(sessionId), ExistingWorkPolicy.KEEP, request)
         }
     }
 
@@ -98,7 +104,7 @@ class CloudProcessingWorker(
             // The only step left that needs a connection: structuring via Gemini (spec 10.1).
             val apiKey = ApiKeyStore(applicationContext).getGeminiKey()
             val structured = GeminiStructuringService(apiKey = apiKey)
-                .structure(transcript.rawText, language, languageName)
+                .structure(transcript.rawText, language, languageName, partyAName, partyBName)
 
             val documentId = UUID.randomUUID().toString()
             val gson = Gson()
@@ -159,7 +165,17 @@ class CloudProcessingWorker(
             db.sessionDao().getById(sessionId)?.let {
                 db.sessionDao().upsert(it.copy(status = SessionStatus.FAILED))
             }
-            if (runAttemptCount < 5) Result.retry() else Result.failure()
+            // Previously this was retried silently up to 5 times and then just
+            // Result.failure()'d with no reason attached anywhere — the UI had no way
+            // to know processing had died at all, so ProcessingScreen spun forever.
+            // Attaching the message to the WorkInfo output lets the ViewModel observe
+            // it and actually tell the user what happened.
+            val reason = e.message ?: e.javaClass.simpleName
+            if (runAttemptCount < 5) {
+                Result.retry()
+            } else {
+                Result.failure(workDataOf(KEY_ERROR to reason))
+            }
         }
     }
 }

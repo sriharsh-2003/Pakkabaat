@@ -27,6 +27,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import com.pakkabaat.app.pairing.QrCodeUtil
+import com.pakkabaat.app.util.KeepScreenOn
 
 private fun requiredPermissions(): Array<String> {
     val base = mutableListOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA)
@@ -68,9 +69,14 @@ fun StartSessionScreen(
     pairingError: String?,
     onBecomeInitiator: () -> Unit,
     onScannedToken: (String) -> Unit,
+    onStartSinglePhone: (otherPersonName: String) -> Unit,
     onContinueToConsent: () -> Unit,
     onDismissError: () -> Unit
 ) {
+    // Covers both the QR display/wait states and the "waiting for scan result" state —
+    // this screen otherwise sits idle with no touch input while two people position
+    // their phones to scan, and would previously lock mid-pairing.
+    KeepScreenOn()
     val context = LocalContext.current
     val activity = context as? Activity
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -83,7 +89,9 @@ fun StartSessionScreen(
     // Grant permissions doesn't do anything" bug: the system re-delivers an instant
     // denial with no dialog shown at all, so nothing appears to happen.
     var permanentlyDenied by remember { mutableStateOf(false) }
-    var mode by remember { mutableStateOf<String?>(null) } // "show" or "scan"
+    var mode by remember { mutableStateOf<String?>(null) } // "show", "scan", or "single"
+    var singlePhoneOtherName by remember { mutableStateOf("") }
+    var singlePhoneError by remember { mutableStateOf<String?>(null) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -227,6 +235,44 @@ fun StartSessionScreen(
                     },
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("Scan the other person's code") }
+                Spacer(Modifier.height(12.dp))
+                OutlinedButton(
+                    onClick = { mode = "single" },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Use one phone (both people here)") }
+            }
+            "single" -> {
+                Text(
+                    "Both of you are using this one phone. Enter the other person's name — " +
+                        "the rest of the process (consent, recording, and the written record) " +
+                        "works the same way.",
+                    textAlign = TextAlign.Center
+                )
+                Spacer(Modifier.height(20.dp))
+                OutlinedTextField(
+                    value = singlePhoneOtherName,
+                    onValueChange = { singlePhoneOtherName = it; singlePhoneError = null },
+                    label = { Text("Other person's name") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                singlePhoneError?.let {
+                    Spacer(Modifier.height(6.dp))
+                    Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                }
+                Spacer(Modifier.height(16.dp))
+                Button(
+                    onClick = {
+                        if (singlePhoneOtherName.isBlank()) {
+                            singlePhoneError = "Please enter the other person's name."
+                        } else {
+                            onStartSinglePhone(singlePhoneOtherName.trim())
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Continue") }
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(onClick = { mode = null }, modifier = Modifier.fillMaxWidth()) { Text("Back") }
             }
             "show" -> {
                 Text(

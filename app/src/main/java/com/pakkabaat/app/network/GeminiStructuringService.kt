@@ -22,7 +22,13 @@ class GeminiStructuringService(
     private val apiKey: String? = null
 ) {
 
-    suspend fun structure(transcript: String, languageCode: String, languageName: String): StructuringResult {
+    suspend fun structure(
+        transcript: String,
+        languageCode: String,
+        languageName: String,
+        partyAName: String,
+        partyBName: String
+    ): StructuringResult {
         val key = apiKey?.takeIf { it.isNotBlank() } ?: BuildConfig.GEMINI_API_KEY
         check(key.isNotBlank()) {
             "No Gemini API key available. Enter one in Settings (get a free key at " +
@@ -34,14 +40,22 @@ class GeminiStructuringService(
             contents = listOf(
                 GeminiContent(
                     role = "user",
-                    parts = listOf(GeminiPart(StructuringPrompts.buildUserPrompt(transcript, languageCode, languageName)))
+                    parts = listOf(GeminiPart(
+                        StructuringPrompts.buildUserPrompt(transcript, languageCode, languageName, partyAName, partyBName)
+                    ))
                 )
             )
         )
 
         val response = api.generateContent(model = model, apiKey = key, body = request)
         val fullText = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text
-            ?: error("Gemini returned no text content.")
+        // With thinkingBudget=0 this should never come back blank anymore, but keep a
+        // clear, specific error instead of an obscure NPE further down if it ever does
+        // (e.g. the call was blocked by a safety filter).
+        if (fullText.isNullOrBlank()) {
+            val finishReason = response.candidates?.firstOrNull()?.finishReason
+            error("Gemini returned no text content (finishReason=$finishReason).")
+        }
 
         return parse(fullText)
     }

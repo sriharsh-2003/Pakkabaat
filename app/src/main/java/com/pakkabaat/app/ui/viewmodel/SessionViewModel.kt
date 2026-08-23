@@ -3,6 +3,9 @@ package com.pakkabaat.app.ui.viewmodel
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import com.google.gson.Gson
 import com.pakkabaat.app.consent.stopTimeoutCountdown
 import com.pakkabaat.app.data.db.*
 import com.pakkabaat.app.data.model.*
@@ -31,6 +34,9 @@ data class SessionUiState(
     val qrToken: String? = null,               // shown as QR when I'm Party A
     val pairingConnected: Boolean = false,
     val partnerName: String? = null,
+    // Single-phone mode: both people are physically present at one device, so there's
+    // no pairing/QR step at all — the host just types in the other person's name.
+    val singlePhoneMode: Boolean = false,
     val myConsent: Boolean = false,
     val otherConsent: Boolean = false,
     val isRecording: Boolean = false,
@@ -123,6 +129,49 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         listenOnPairingChannel(scannedSessionToken, isAdvertiser = false)
     }
 
+    /** Single-phone mode: both parties are physically present at this one device, so
+     *  there's no pairing/QR step, no second device, and no partner Gemini call to wait
+     *  on. The host (this device) is always the "party A" role and is always the one
+     *  that runs Gemini structuring, exactly as the paired host flow does. Consent is
+     *  a single tap here (see maybeBeginRecording — otherConsent is set true up-front
+     *  since a second physical device confirming isn't part of this mode), which then
+     *  takes the same ConsentScreen -> RecordingScreen -> ProcessingScreen path as the
+     *  two-phone flow. */
+    fun startSinglePhoneMode(otherPersonName: String) {
+        val sessionId = UUID.randomUUID().toString()
+        _uiState.update {
+            it.copy(
+                sessionId = sessionId,
+                role = PartyRole.PARTY_A,
+                qrToken = null,
+                singlePhoneMode = true,
+                pairingConnected = true,
+                partnerName = otherPersonName.trim(),
+                myConsent = false,
+                otherConsent = true
+            )
+        }
+        viewModelScope.launch {
+            db.sessionDao().upsert(
+                SessionEntity(
+                    sessionId = sessionId,
+                    partyAUserId = _uiState.value.myUserId,
+                    partyBUserId = null,
+                    partyBPhone = null,
+                    partyAName = _uiState.value.myName,
+                    partyBName = otherPersonName.trim(),
+                    mode = SessionMode.IN_PERSON,
+                    status = SessionStatus.PENDING_CONSENT,
+                    startedAt = null,
+                    endedAt = null,
+                    stopRequestedBy = null,
+                    stopConfirmedBy = null,
+                    myRole = PartyRole.PARTY_A
+                )
+            )
+        }
+    }
+
     /** Call this when the user backs out of pairing/consent before a session is recorded
      *  (e.g. taps back from the QR screen, or from the consent screen before agreeing).
      *  Tears down any in-progress advertising/discovery and, if a session row was already
@@ -144,7 +193,7 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update {
             it.copy(
                 sessionId = "", qrToken = null, pairingConnected = false, partnerName = null,
-                myConsent = false, otherConsent = false
+                myConsent = false, otherConsent = false, singlePhoneMode = false
             )
         }
     }
@@ -246,6 +295,79 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
                 stopTimeoutJob?.cancel()
                 finishRecording(viaTimeout = true)
             }
+            is SessionMessage.DraftReady -> applyReceivedDraft(message)
+            is SessionMessage.DraftFailed -> {
+                _uiState.update { it.copy(processing = false, error = "The host's processing failed: ${message.reason}") }
+            }
+        }
+    }
+
+    /** Non-host (Party B) side of the single-Gemini-call flow: build this device's own
+     *  StructuredDocumentEntity + CertificateEntity from the content the host already
+     *  extracted, without ever calling Gemini itself. Uses this device's OWN transcript
+     *  id, recording, and audio hash — only the drafted terms/text are shared, per
+     *  spec 7.1 (each party keeps their own recording). */
+    private fun applyReceivedDraft(message: SessionMessage.DraftReady) {
+        viewModelScope.launch {
+            val sessionId = _uiState.value.sessionId
+            val recordingId = currentRecordingId ?: db.audioRecordingDao().forSession(sessionId)?.recordingId
+            val transcript = recordingId?.let { db.transcriptDao().forRecording(it).firstOrNull() }
+            val recording = recordingId?.let { db.audioRecordingDao().forSession(sessionId) }
+            if (recordingId == null || transcript == null || recording == null) {
+                _uiState.update { it.copy(processing = false, error = "Could not save the received draft — local recording is missing.") }
+                return@launch
+            }
+
+            val s = _uiState.value
+            val documentId = UUID.randomUUID().toString()
+            db.structuredDocumentDao().upsert(
+                StructuredDocumentEntity(
+                    documentId = documentId,
+                    sessionId = sessionId,
+                    transcriptId = transcript.transcriptId,
+                    partyAName = s.partnerName ?: "Party A",
+                    partyBName = s.myName,
+                    agreementType = runCatching { AgreementType.valueOf(message.agreementType.uppercase()) }.getOrDefault(AgreementType.OTHER),
+                    amount = message.amount,
+                    currency = message.currency,
+                    termsJson = message.termsJson,
+                    conditions = message.conditions,
+                    unclearItemsJson = message.unclearItemsJson,
+                    dateOfConversation = message.dateOfConversation,
+                    generatedAt = System.currentTimeMillis(),
+                    modelUsed = message.modelUsed
+                )
+            )
+            db.certificateDao().upsert(
+                CertificateEntity(
+                    certificateId = UUID.randomUUID().toString(),
+                    documentId = documentId,
+                    audioSha256 = recording.sha256Hash,
+                    transcriptSha256 = com.pakkabaat.app.util.HashUtil.sha256Text(transcript.rawText),
+                    deviceMetadataJson = Gson().toJson(
+                        mapOf(
+                            "device" to android.os.Build.MODEL,
+                            "androidVersion" to android.os.Build.VERSION.RELEASE,
+                            "processedAt" to System.currentTimeMillis(),
+                            "asrEngine" to "whisper.cpp (on-device)",
+                            "structuring" to "received from host device"
+                        )
+                    ),
+                    generatedAt = System.currentTimeMillis(),
+                    certificateStatement = "This recording was made with the informed, verified " +
+                        "consent of both named parties, captured via OTP-authenticated devices at " +
+                        "the timestamps recorded. The audio file's SHA-256 hash is provided to " +
+                        "verify it has not been altered since creation. This statement is a draft " +
+                        "placeholder and has not been reviewed by a lawyer for BSA Section 63 " +
+                        "compliance."
+                )
+            )
+            db.audioRecordingDao().setUploadStatus(recordingId, UploadStatus.UPLOADED)
+            db.sessionDao().getById(sessionId)?.let {
+                db.sessionDao().upsert(it.copy(status = SessionStatus.COMPLETED))
+            }
+            // observeDocumentReady (already running from finishRecording) picks this up
+            // via the DB flow and flips processing=false itself.
         }
     }
 
@@ -372,32 +494,90 @@ class SessionViewModel(application: Application) : AndroidViewModel(application)
             )
             _uiState.update { it.copy(draftTranscript = transcriptResult.text, draftIsPlaceholder = transcriptResult.isPlaceholder) }
 
-            // Queue the structuring step. Runs now if online, or the moment signal returns
-            // if not — WorkManager's NetworkType.CONNECTED constraint handles both (spec 6.4/8.7).
             val online = ConnectivityUtil.isOnline(getApplication())
             _uiState.update { it.copy(isOnline = online) }
             val s = _uiState.value
-            CloudProcessingWorker.enqueue(
-                context = getApplication(),
-                sessionId = sessionId,
-                recordingId = recordingId,
-                transcriptId = transcriptId,
-                language = language,
-                languageName = LanguageCatalog.nameFor(language),
-                partyAName = if (s.role == PartyRole.PARTY_A) s.myName else (s.partnerName ?: "Party A"),
-                partyBName = if (s.role == PartyRole.PARTY_B) s.myName else (s.partnerName ?: "Party B")
-            )
+            val isHost = s.singlePhoneMode || s.role == PartyRole.PARTY_A
+            val partyAName = if (s.role == PartyRole.PARTY_A) s.myName else (s.partnerName ?: "Party A")
+            val partyBName = if (s.role == PartyRole.PARTY_B) s.myName else (s.partnerName ?: "Party B")
+
+            if (isHost) {
+                // Only the host calls Gemini. Previously BOTH phones independently
+                // structured the same transcript, doubling Gemini API usage/credits for
+                // every session for no benefit — the host now does the one call and
+                // hands the finished draft to the other phone over the same Nearby
+                // link once it's done (see observeDocumentReady below).
+                CloudProcessingWorker.enqueue(
+                    context = getApplication(),
+                    sessionId = sessionId,
+                    recordingId = recordingId,
+                    transcriptId = transcriptId,
+                    language = language,
+                    languageName = LanguageCatalog.nameFor(language),
+                    partyAName = partyAName,
+                    partyBName = partyBName
+                )
+                observeHostWorkFailure(sessionId)
+            }
+            // Non-host: nothing to enqueue — just wait. Either the DB flow below picks
+            // up a document (shouldn't normally happen on this side, but loadExistingSession
+            // reuses the same path) or applyReceivedDraft() writes one in as soon as the
+            // host's SessionMessage.DraftReady arrives (see handleIncoming).
 
             observeDocumentReady(sessionId)
         }
     }
+
+    /** Host-only: if the Gemini call ultimately fails (bad/missing key, no signal after
+     *  retries, parse failure, etc.), surface it in this device's UI AND tell the
+     *  partner device so its ProcessingScreen doesn't spin forever waiting for a draft
+     *  that's never coming. */
+    private fun observeHostWorkFailure(sessionId: String) {
+        viewModelScope.launch {
+            WorkManager.getInstance(getApplication<Application>())
+                .getWorkInfosForUniqueWorkFlow(CloudProcessingWorker.workName(sessionId))
+                .collect { infos ->
+                    val info = infos.firstOrNull() ?: return@collect
+                    if (info.state == WorkInfo.State.FAILED) {
+                        val reason = info.outputData.getString(CloudProcessingWorker.KEY_ERROR)
+                            ?: "Processing failed after several attempts."
+                        _uiState.update { it.copy(processing = false, error = reason) }
+                        pairing.send(SessionMessage.DraftFailed(reason))
+                    }
+                }
+        }
+    }
+
+    private var draftSentForSession: String? = null
 
     private fun observeDocumentReady(sessionId: String) {
         viewModelScope.launch {
             db.structuredDocumentDao().observeForSession(sessionId).collect { doc ->
                 if (doc != null) {
                     val cert = db.certificateDao().forDocument(doc.documentId)
-                    _uiState.update { it.copy(document = doc, certificate = cert, processing = false) }
+                    _uiState.update { it.copy(document = doc, certificate = cert, processing = false, error = null) }
+
+                    // Host, paired (not single-phone): hand the finished draft to the
+                    // partner device so it never has to call Gemini itself. Guarded so a
+                    // later DB emission for the same session (e.g. re-collecting after
+                    // loadExistingSession) doesn't resend.
+                    val s = _uiState.value
+                    val isHost = !s.singlePhoneMode && s.role == PartyRole.PARTY_A
+                    if (isHost && draftSentForSession != sessionId) {
+                        draftSentForSession = sessionId
+                        pairing.send(
+                            SessionMessage.DraftReady(
+                                agreementType = doc.agreementType.name,
+                                amount = doc.amount,
+                                currency = doc.currency,
+                                termsJson = doc.termsJson,
+                                conditions = doc.conditions,
+                                unclearItemsJson = doc.unclearItemsJson,
+                                dateOfConversation = doc.dateOfConversation,
+                                modelUsed = doc.modelUsed
+                            )
+                        )
+                    }
                 }
             }
         }

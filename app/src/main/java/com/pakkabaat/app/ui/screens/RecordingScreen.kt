@@ -8,6 +8,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.pakkabaat.app.util.KeepScreenOn
 
 @Composable
 fun RecordingScreen(
@@ -18,6 +19,9 @@ fun RecordingScreen(
     onStop: () -> Unit,
     onConfirmStop: () -> Unit
 ) {
+    // Recording can run for many minutes with no touch input at all — never let the
+    // screen lock mid-recording.
+    KeepScreenOn()
     Column(
         Modifier.fillMaxSize().padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,

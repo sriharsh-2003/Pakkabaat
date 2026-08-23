@@ -95,6 +95,7 @@ fun PakkaBaatNavGraph() {
                 pairingError = state.error,
                 onBecomeInitiator = { viewModel.startAsInitiator() },
                 onScannedToken = { token -> viewModel.joinAsScanner(token) },
+                onStartSinglePhone = { otherName -> viewModel.startSinglePhoneMode(otherName) },
                 onContinueToConsent = { navController.navigate(Routes.CONSENT) },
                 onDismissError = { viewModel.clearPairingError() }
             )
@@ -141,7 +142,8 @@ fun PakkaBaatNavGraph() {
             ProcessingScreen(
                 draftTranscript = state.draftTranscript,
                 isOnline = state.isOnline,
-                stopViaTimeout = state.stopViaTimeout
+                stopViaTimeout = state.stopViaTimeout,
+                errorMessage = state.error
             )
         }
 

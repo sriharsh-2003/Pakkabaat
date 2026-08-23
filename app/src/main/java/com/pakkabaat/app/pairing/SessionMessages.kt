@@ -16,6 +16,32 @@ sealed class SessionMessage {
     data class StopConfirm(val userId: String, val timestamp: Long) : SessionMessage()
     data class StopTimeoutOverride(val userId: String, val timestamp: Long) : SessionMessage()
 
+    /**
+     * Sent by the host device (Party A) once its own Gemini structuring call finishes,
+     * so Party B's device never has to make its own Gemini call for the same
+     * conversation — previously BOTH phones independently called Gemini on their own
+     * on-device transcript, doubling API usage/credits for every single session and
+     * risking two slightly different drafts. Party B still keeps its own audio
+     * recording and transcript (each phone records its own copy, per spec 7.1) and
+     * builds its own certificate from its own audio hash — only the drafted content
+     * itself is shared, not the audio.
+     */
+    data class DraftReady(
+        val agreementType: String,
+        val amount: Double?,
+        val currency: String,
+        val termsJson: String,
+        val conditions: String,
+        val unclearItemsJson: String,
+        val dateOfConversation: Long,
+        val modelUsed: String
+    ) : SessionMessage()
+
+    /** Sent by Party A to Party B if the host's Gemini call ultimately failed, so
+     *  Party B's ProcessingScreen doesn't spin forever waiting for a draft that will
+     *  never arrive. */
+    data class DraftFailed(val reason: String) : SessionMessage()
+
     companion object {
         private val gson = Gson()
 
@@ -34,6 +60,8 @@ sealed class SessionMessage {
                     "StopRequest" -> gson.fromJson(envelope.payload, StopRequest::class.java)
                     "StopConfirm" -> gson.fromJson(envelope.payload, StopConfirm::class.java)
                     "StopTimeoutOverride" -> gson.fromJson(envelope.payload, StopTimeoutOverride::class.java)
+                    "DraftReady" -> gson.fromJson(envelope.payload, DraftReady::class.java)
+                    "DraftFailed" -> gson.fromJson(envelope.payload, DraftFailed::class.java)
                     else -> null
                 }
             } catch (e: Exception) {

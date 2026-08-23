@@ -1,0 +1,20 @@
+diff --git a/app/src/main/java/com/pakkabaat/app/ui/screens/StartSessionScreen.kt b/app/src/main/java/com/pakkabaat/app/ui/screens/StartSessionScreen.kt
+index 22d1f7f..ca2eb19 100644
+--- a/app/src/main/java/com/pakkabaat/app/ui/screens/StartSessionScreen.kt
++++ b/app/src/main/java/com/pakkabaat/app/ui/screens/StartSessionScreen.kt
+@@ -38,7 +38,6 @@ private fun requiredPermissions(): Array<String> {
+     base += Manifest.permission.ACCESS_FINE_LOCATION
+     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+         base += Manifest.permission.NEARBY_WIFI_DEVICES
+-        base += Manifest.permission.POST_NOTIFICATIONS
+     }
+     return base.toTypedArray()
+ }
+@@ -58,7 +57,6 @@ private fun permissionLabel(permission: String): String = when (permission) {
+     Manifest.permission.BLUETOOTH_CONNECT -> "Nearby devices (connect)"
+     Manifest.permission.BLUETOOTH_SCAN -> "Nearby devices (scan)"
+     Manifest.permission.NEARBY_WIFI_DEVICES -> "Nearby Wi-Fi devices"
+-    Manifest.permission.POST_NOTIFICATIONS -> "Notifications"
+     else -> permission.substringAfterLast('.')
+ }
+ 
